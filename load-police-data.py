@@ -2,7 +2,7 @@
 # Script to load police data (https://data.police.uk/)
 
 # load required libraries
-import getopt, sys, pprint, copy, re
+import getopt, sys, pprint, copy, re, json, pdb
 from time import sleep
 from types import *
 from datetime import datetime, timedelta
@@ -10,10 +10,16 @@ import calendar
 from dateutil import relativedelta
 import requests 		# http://docs.python-requests.org/en/master/
 import mysql.connector 		# https://dev.mysql.com/doc/connector-python/en
-import json
+
+# experimental codec failure override
+# otherwise mysql_cursor.execute(query) returns occasional
+# An exception of type UnicodeDecodeError occurred. Arguments:
+# ('utf8', '\x00\xfb', 1, 2, 'invalid start byte')
+import codecs
+codecs.register_error("strict", codecs.ignore_errors) # this is a BAD SOLUTION
 
 # hard coded defaults
-region = 'Reading Borough Council'
+region = 'Reading Borough'
 user = 'datamap' 	# mysql user
 password = 'datamap' 	# mysql password
 host = 'localhost' 	# mysql host
@@ -48,24 +54,54 @@ def mysql_function(function, params):
 		query = query + ')'
 	else:
 		for param in params:
+			#print 'DBG: param=' + repr(param)
 			if param is None:
 				query = query + "null,"
-			elif type(param) is StringType or type(param) is UnicodeType:	
-				query = query + "'" + re.sub('[\"\']', '', str(param.encode("utf-8"))) + "',"
+			elif type(param) is StringType or type(param) is UnicodeType:
+				#print 'DBG: param is Unicode'
+				try:
+					param = str(param.encode('utf-8', 'ignore'))
+				except Exception as ex:
+					print 'ERR: mysql_function param utf-8 conversion failed: "' + str(param) + '".'
+  					template = " - An exception of type {0} occurred. Arguments:\n{1!r}"
+    					message = template.format(type(ex).__name__, ex.args)
+    					print message
+					sys.exit(1)
+				param = re.sub('[\"\']', '', param) # delete quotes
+				query = query + "'" + param + "',"
 			else:
+				#print 'DBG: param is not Unicode'
 				query = query + str(param) + ","
 		query = re.sub(',$', ')', query)
-	# print "DBG: query = " + query
-	mysql_function = db.cursor()
+	#print "DBG: X"
+	mysql_cursor = db.cursor()
+	#print "DBG: Y"
 	try:
-		mysql_function.execute(query)
-	except:
-		print 'ERR: mysql_function query "' + query + '" failed.'
-		return None
-	resultset = mysql_function.fetchone()
-	# print resultset
+		#print "DBG: query = " + query
+		mysql_cursor.execute(query)
+		#print "DBG: Z"
+	#except mysql.connector.Error as err:
+	#	print 'ERR: mysql_function query "' + query + '" failed.'
+	#	print("ERR: mysql connect error: {}".format(err))
+	#	return None
+	#except:
+	#	print 'ERR: mysql_function query "' + query + '" failed.'
+	#	print 'ERR: cursor warnings: ' + str(mysql_function.fetchwarnings())
+	#	return None
+	except Exception as ex:
+		print 'ERR: mysql_function query ' + repr(query) + ' failed.'
+  		template = " - An exception of type {0} occurred. Arguments:\n{1!r}"
+    		message = template.format(type(ex).__name__, ex.args)
+    		print message
+		#pdb.post_mortem()
+		#sys.exit(1)
+		#return None
+	resultset = mysql_cursor.fetchone()
+	#print "DBG: resultset = " + str(resultset)
+	#print "DBG: db.commit()..."
 	db.commit()
-	mysql_function.close()
+	# print "DBG: DONE db.commit()"
+	mysql_cursor.close()
 	if resultset is not None:
 		return resultset[0]
 	return None
@@ -74,15 +110,18 @@ def mysql_function(function, params):
 def mysql_procedure(procedure, params):
 	if procedure is None:
 		print "ERR: mysql_procedure : must specify procedure"
-		return None
-	mysql_procedure = db.cursor()
+		return False
+	mysql_cursor = db.cursor()
 	try:
-		out = mysql_procedure.callproc(procedure, params)
+		out = mysql_cursor.callproc(procedure, params)
+	except mysql.connector.Error as err:
+		print("ERR: mysql connect error: {}".format(err))
+		return False
 	except:
-		print 'ERR: mysql_procedure failed.'
+		print 'ERR: cursor warning: ' + str(mysql_cursor.fetchwarnings())
 		return False
 	db.commit()
-	mysql_procedure.close()
+	mysql_cursor.close()
 	return True
 
 # returns python map (ie assoc array) of JSON returned by given URL
@@ -249,19 +288,28 @@ def load_categories(month):
 	crime_categories = get_police_data('crime-categories',{'date': month_string})
 	if crime_categories is not None and len(crime_categories) > 0:
 		for crime_category in crime_categories:
-			query = "select count(*) from category where type = 'police-crime' and identifier = '" + crime_category['url'] + "'"
+			query = "select count(*) from category where type = 'police-crime' and identifier = '" + re.sub('[ -]+', '-', crime_category['url'].strip()) + "'"
 			try:
 				load_category_cursor.execute(query)
 			except:
 				print('ERR: Unable to get run query "' + query + '"')
 				# sys.exit(1)
 				return 0
-			category_count = load_category_cursor.fetchone()
+			category_count = load_category_cursor.fetchone()[0]
+			# print "DBG: category_count = " + str(category_count)
 			if category_count == 0 :
-				mysql_function('post_category', ['police-crime', crime_category['url'], crime_category['name'], 'https://www.police.uk/about-this-site/faqs/#what-do-the-crime-categories-mean'])
-
+				output = mysql_function('post_category', [
+								'police-crime', 
+								re.sub('[ -]+', '-', crime_category['url'].strip()), 
+								crime_category['name'], 
+								'https://www.police.uk/about-this-site/faqs/#what-do-the-crime-categories-mean'
+								])
+				# print "DBG: output = " + str(output)
 	load_category_cursor.close()
-	return len(crime_categories)
+	if crime_categories is not None:
+		return len(crime_categories)
+	else:
+		return 0
 
 # loads crime data
 def load_crimes(place, month):
@@ -289,14 +337,15 @@ def load_crimes(place, month):
 	count = 0
 	crimes = get_police_data( '/crimes-street/all-crime', {'poly': place_string, 'date': month_string})
 	if crimes is None or len(crimes) == 0:
-		print "INF: No crimes to load"
+		#print "INF: No crimes to load"
 		return 0
 	else:
 		for crime in crimes:
 			count = count + 1
+			#if count >= 384: # debug code
 			#print "DBG: Loading crime " + str(count) + "/" + str(len(crimes)) + " : " + str(crime['id'])
-			# print crime
-			
+			#print repr(crime)
+				
 			crime_id = mysql_function('post_police_crime', [\
 					crime['category'], \
 					crime['id'], \
@@ -304,7 +353,7 @@ def load_crimes(place, month):
 					crime['context'], \
 					crime['month'], \
 					crime['location_type'] \
-						if 'location' in crime else None, \
+						if 'location_type' in crime else None, \
 					crime['location_subtype'] \
 						if 'location_subtype' in crime else None,\
 					crime['location']['street']['id'], \
@@ -318,7 +367,10 @@ def load_crimes(place, month):
 					crime['outcome_status']['date'] \
 						if ('outcome_status' in crime and crime['outcome_status'] is not None and 'date' in crime['outcome_status']) else None \
 				])
-	return len(crimes)
+	if crimes is not None:
+		return len(crimes)
+	else:
+		return 0
 
 # loads outcome data
 def load_outcomes(place, month):
@@ -346,11 +398,12 @@ def load_outcomes(place, month):
 	count = 0
 	outcomes = get_police_data( '/outcomes-at-location', {'poly': place_string, 'date': month_string})
 	if outcomes is None or len(outcomes) == 0:
-		print "INF: No outcomes to load"
+		#print "INF: No outcomes to load"
+		return 0
 	else:
 		for outcome in outcomes:
 			count = count + 1
-			#print "DBG: Loading outcome for crime " + str(count) + "/" + str(len(outcomes)) + " : " + str(outcome['crime']['id'])
+			# print "DBG: Loading outcome for crime " + str(count) + "/" + str(len(outcomes)) + " : " + str(outcome['crime']['id'])
 			# print outcome
 			
 			outcome_id = mysql_function('post_police_outcome', [\
@@ -360,12 +413,47 @@ def load_outcomes(place, month):
 					outcome['date'], \
 					outcome['person_id'] \
 						if 'person_id' in outcome else None, \
-					outcome['crime']['id'], \
+					outcome['crime']['category'] \
+						if ('crime' in outcome and outcome['crime'] is not None and 'category' in outcome['crime']) 		else None, \
+					outcome['crime']['id'] \
+						if ('crime' in outcome and outcome['crime'] is not None and 'id' in outcome['crime']) 			else None, \
 					outcome['crime']['persistent_id'] \
-						if 'persistent_id' in outcome['crime'] else None \
+						if ('crime' in outcome and outcome['crime'] is not None and 'persistent_id' in outcome['crime']) 	else None, \
+					outcome['crime']['context'] \
+						if ('crime' in outcome and outcome['crime'] is not None and 'context' in outcome['crime']) 		else None, \
+					outcome['crime']['month'] \
+						if ('crime' in outcome and outcome['crime'] is not None and 'month' in outcome['crime']) 		else None, \
+					outcome['crime']['location_type'] \
+						if ('crime' in outcome and outcome['crime'] is not None and 'location_type' in outcome['crime']) 	else None, \
+					outcome['crime']['location_subtype'] \
+						if ('crime' in outcome and outcome['crime'] is not None and 'location_subtype' in outcome['crime']) 	else None, \
+					outcome['crime']['location']['street']['id'] \
+						if (	'crime' 	in outcome 				and outcome['crime'] 				is not None and \
+							'location' 	in outcome['crime'] 			and outcome['crime']['location'] 		is not None and \
+							'street' 	in outcome['crime']['location'] 	and outcome['crime']['location']['street'] 	is not None and \
+							'id'		in outcome['crime']['location']['street'] \
+						) else None, \
+					outcome['crime']['location']['street']['name'] \
+						if (	'crime' 	in outcome 				and outcome['crime'] 				is not None and \
+							'location' 	in outcome['crime'] 			and outcome['crime']['location'] 		is not None and \
+							'street' 	in outcome['crime']['location'] 	and outcome['crime']['location']['street'] 	is not None and \
+							'name'		in outcome['crime']['location']['street'] \
+						) else None, \
+					outcome['crime']['location']['latitude'] \
+						if (	'crime' 	in outcome 				and outcome['crime'] 			is not None and \
+							'location' 	in outcome['crime'] 			and outcome['crime']['location'] 	is not None and \
+							'latitude'	in outcome['crime']['location'] \
+						) else None, \
+					outcome['crime']['location']['longitude'] \
+						if (	'crime' 	in outcome 				and outcome['crime'] 			is not None and \
+							'location' 	in outcome['crime'] 			and outcome['crime']['location'] 	is not None and \
+							'longitude'	in outcome['crime']['location'] \
+						) else None \
 				])
-	return len(outcomes)
-
+	if outcomes is not None:
+		return len(outcomes)
+	else:
+		return 0
 
 # loads stops data
 # https://data.police.uk/api/stops-street?poly=52.268,0.543:52.794,0.238:52.130,0.478&date=2015-01
@@ -394,7 +482,8 @@ def load_stops(place, month):
 	count = 0
 	stops = get_police_data( '/stops-street', {'poly': place_string, 'date': month_string})
 	if stops is None or len(stops) == 0:
-		print "INF: No stops to load"
+		#print "INF: No stops to load"
+		return 0
 	else:
 		for stop in stops:
 			count = count + 1
@@ -413,8 +502,10 @@ def load_stops(place, month):
 						if 'operation_name' in stop else None, \
 					stop['removal_of_more_than_outer_clothing'] \
 						if 'removal_of_more_than_outer_clothing' in stop else None, \
-					stop['outcome'] \
-						if 'outcome' in stop else None, \
+					#stop['outcome'] \
+					#	if 'outcome' in stop else None, \
+					stop['outcome_object']['name'] \
+						if ('outcome_object' in stop and stop['outcome_object'] is not None and 'name' in stop['outcome_object']) else None, \
 					stop['legislation'] \
 						if 'legislation' in stop else None, \
 					stop['involved_person'] \
@@ -436,7 +527,10 @@ def load_stops(place, month):
 					stop['age_range'] \
 						if 'age_range' in stop else None \
 				])
-	return len(stops)
+	if stops is not None:
+		return len(stops)
+	else:
+		return 0
 
 ### MAIN ###
 
@@ -469,7 +563,7 @@ if region is None or user is None or password is None or host is None or databas
 
 # test connection to database
 try:
-	db = mysql.connector.connect(user = user, password = password, host = host, database = database)
+	db = mysql.connector.connect(user=user, password=password, host=host, database=database, charset='utf8', get_warnings=True, raise_on_warnings=True)
 except:
 	print('ERR: Unable to connect to database "' + database + '" with user "' + user + '"' )
 	sys.exit(1)
@@ -485,66 +579,106 @@ else :
 	police_data_last_updated = standardise_date(police_data_last_updated[0]['date'])
 #print('INF: Connection to police API : OK')
 
-# get last update value (assume 10 yrs ago if blank)
+# default data load start date (earliest police data 2015-01)
+# default_start = standardise_date(datetime.strftime(datetime.today().date() - timedelta(days=1095), '%Y-%m-01')) # 3 yr
+# default_start = standardise_date(datetime.strftime(datetime.today().date() - timedelta(days=1825), '%Y-%m-01')) # 5 yr
+default_start = standardise_date(datetime.strftime(datetime.today().date() - timedelta(days=365), '%Y-%m-01')) # 1 yr
+#default_start =  '2015-06-01' # fixed date
+#print "DBG: default_start : " + default_start
+
+# get last update value (assume default_start if blank)
 local_data_last_updated = standardise_date(mysql_function('get_variable', ['crime-last-updated']))
 if local_data_last_updated is None or len(local_data_last_updated) == 0:
-	local_data_last_updated = standardise_date(datetime.strftime(datetime.today().date() - timedelta(days=3650), '%Y-%m-01'))
+	local_data_last_updated = default_start
+	mysql_procedure('post_variable', ['crime-last-updated', default_start])
 
 # exit here if already updated
 # police_data_last_updated is always in the form 'YYYY-MM-01' which actually means 'YYYY-MM-DD' where DD is last day of month
 if datetime.strptime(local_data_last_updated, '%Y-%m-%d') >= datetime.strptime(police_data_last_updated, '%Y-%m-%d'):
-	#print('INF: Already up to date; nothing to do.')
+	# print('INF: Already up to date; nothing to do.')
 	sys.exit(0)
+
+# test police data load isnt already running
+# mysql_procedure('delete_variable', ['police-data-load'])
+if mysql_function('get_variable', ['police-data-load']) is not None:
+	print('ERR: Police data load is already running (or failed previously)' )
+	sys.exit(1)
+mysql_procedure('post_variable', ['police-data-load', 'started'])
 
 # test region specified exists
 if region is not None and mysql_function('exists_place', ['name', region ]) == 0 :
 	print('ERROR : Region "' + region + '" has not been loaded into the database')
 	sys.exit(1)
-#print('INF: Region specified : OK' )
+# print('INF: Region specified : OK' )
 
 # debug quit before loading
-#sys.exit(0)
+# sys.exit(0)
 
 # load force(s) for region
 if 'no-force-load' not in options:
+	mysql_procedure('put_variable', ['police-data-load', 'loading force and neighbourhood data' ])
 	if load_force(region) is None:
 		print('Unable to load forces for region "' + region + '"')
 		sys.exit(1)
-	#print('INF: Force data loaded : OK')
+	# print('INF: Force data loaded : OK')
+
+loop = 1 # safety net
+maxloop = 100 # safety net
 
 # wind through each month (currently starts loop on latest already-loaded month)
-loop = 1 # safety net
-maxloop = 100
-while datetime.strptime(local_data_last_updated, '%Y-%m-%d') <= datetime.strptime(police_data_last_updated, '%Y-%m-%d') \
-	and datetime.strptime(local_data_last_updated, '%Y-%m-%d') <= datetime.today() \
-	and loop <= maxloop:
+# while datetime.strptime(local_data_last_updated, '%Y-%m-%d') <= datetime.strptime(police_data_last_updated, '%Y-%m-%d') \
 
-	# print "DBG: Loop : " + str(loop) + "/" + str(maxloop) + " (" + local_data_last_updated + "/" + police_data_last_updated + ")"
+# starting point = three years ago (minus 1 month, which is added back on at top of loop)
+month_to_load = default_start
+
+# wind through each month (currently starts loop on 3 years ago, to catch up on later changes to historical data)
+while datetime.strptime(month_to_load, '%Y-%m-%d') <= datetime.strptime(police_data_last_updated, '%Y-%m-%d') \
+	and datetime.strptime(month_to_load, '%Y-%m-%d') <= datetime.today() \
+	and loop <= maxloop:
+	
+	# print "DBG: Loop : " + str(loop) + "/" + str(maxloop) + " (" + month_to_load + " / " + police_data_last_updated + ")"
+	crimes_loaded = 0
 
 	if 'no-category-load' not in options:
-		#print "INF: Loading categories for month '" + local_data_last_updated + "'."
-		load_categories(local_data_last_updated)
+		# print "INF: Loading categories for month '" + month_to_load + "'."
+		mysql_procedure('put_variable', ['police-data-load', 'loading categories ' + ' (' + month_to_load + ' / ' + police_data_last_updated + ')' ])
+		categories_loaded = load_categories(month_to_load)
+		# print "INF: Loaded " + str(categories_loaded) + " category records for '" + month_to_load + "'."
+
+	# debug quit
+	#sys.exit(0)
 
 	if 'no-crime-load' not in options:
-		#print "INF: Loading crime data for region '" + region + "' and month '" + local_data_last_updated + "'."
-		crimes_loaded = load_crimes(region, local_data_last_updated)
+		# print "INF: Loading crime data for region '" + region + "' and month '" + month_to_load + "'."
+		mysql_procedure('put_variable', ['police-data-load', 'loading crimes ' + ' (' + month_to_load + ' / ' + police_data_last_updated + ')' ])
+		crimes_loaded = load_crimes(region, month_to_load)
+		# print "INF: Loaded " + str(crimes_loaded) + " crime records for '" + month_to_load + "'."
 	
 	# only continue if crime data was loaded (note this can cause issues when loading a new DB and crime-last-updated is so old that theres no data for it)
-	if crimes_loaded is not None and crimes_loaded > 0 :
-		if 'no-outcome-load' not in options:
-			#print "INF: Loading outcome data for region '" + region + "' and month '" + local_data_last_updated + "'."
-			load_outcomes(region, local_data_last_updated)
+	# if crimes_loaded is not None and crimes_loaded > 0 :
+	if 'no-outcome-load' not in options:
+		# print "INF: Loading outcome data for region '" + region + "' and month '" + month_to_load + "'."
+		mysql_procedure('put_variable', ['police-data-load', 'loading outcomes ' + ' (' + month_to_load + ' / ' + police_data_last_updated + ')' ])
+		outcomes_loaded = load_outcomes(region, month_to_load)
+		# print "INF: Loaded " + str(outcomes_loaded) + " outcome records for '" + month_to_load + "'."
 
-		if 'no-stop-load' not in options:
-			#print "INF: Loading stop data for region '" + region + "' and month '" + local_data_last_updated + "'."
-			load_stops(region, local_data_last_updated)
+	if 'no-stop-load' not in options:
+		# print "INF: Loading stop data for region '" + region + "' and month '" + month_to_load + "'."
+		mysql_procedure('put_variable', ['police-data-load', 'loading stops ' + ' (' + month_to_load + ' / ' + police_data_last_updated + ')' ])
+		stops_loaded = load_stops(region, month_to_load)
+		# print "INF: Loaded " + str(stops_loaded) + " stop records for '" + month_to_load + "'."
 
-		# update crime-last-updated value if any crimes have been loaded
-		mysql_procedure('put_variable', ['crime-last-updated', local_data_last_updated])
+	# update crime-last-updated value if any crimes have been loaded
+	if datetime.strptime(month_to_load, '%Y-%m-%d') > datetime.strptime(local_data_last_updated, '%Y-%m-%d'):
+		# print "INF: Logging variable 'crime-last-updated' = " + month_to_load + "'."
+		mysql_procedure('put_variable', ['crime-last-updated', month_to_load])
 
-	else:
-		break
-
-	# prepare for next loop
 	loop = loop + 1
-	local_data_last_updated = standardise_date( datetime.strftime( datetime.strptime( local_data_last_updated, '%Y-%m-%d' ) + relativedelta.relativedelta(months=1), '%Y-%m-%d' ) )
+	month_to_load = standardise_date( datetime.strftime( datetime.strptime( month_to_load, '%Y-%m-%d' ) + relativedelta.relativedelta(months=1), '%Y-%m-%d' ) )
+
+# perform data load sanity check
+mysql_procedure('delete_variable', ['crime-load-sanity'])
+mysql_procedure('post_variable', ['crime-load-sanity',  mysql_function('police_crime_sanity_check','') ])
+
+# mark that load has completed
+mysql_procedure('delete_variable', ['police-data-load'])
