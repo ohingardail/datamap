@@ -1,7 +1,7 @@
 /*
 Data mapping MariaDB (nearly MySql) tables & routines
 Author : Adam Harrington
-Date : 26 November 2017
+Date : 23 February 2018
 */
 
 -- Designed to be an abstracted repository of geographic data
@@ -12,9 +12,10 @@ Date : 26 November 2017
 -- Safety
 
 -- set up DB & users
-create database if not exists datamap collate utf8_general_ci;
-create user if not exists 'datamap'@'localhost' IDENTIFIED BY 'datamap'; 
+-- create database if not exists datamap collate utf8_general_ci;
+-- create user if not exists 'datamap'@'localhost' IDENTIFIED BY 'datamap'; 
 -- grant all on datamap.* to 'datamap'@'localhost';
+-- use datamap_test;
 use datamap;
 
 delimiter //
@@ -431,6 +432,7 @@ create function get_type
 	p_uuid	char(32)
 )
 returns varchar(100)
+deterministic
 begin
 	declare l_table 	varchar(64);
 	declare l_type 		varchar(50) default 'null';
@@ -733,6 +735,7 @@ create function propercase
 )
 returns varchar(1000)
 no sql
+deterministic
 begin
 	declare l_len 		tinyint;
 	declare l_count 	tinyint default 1;
@@ -775,6 +778,8 @@ create function get_json_value
 	p_variable	text
 )
 returns text
+no sql
+deterministic
 begin
 	return trim('"' from trim(substring_index( substring_index( p_json, concat('"', trim(p_variable), '":'), -1), ',', 1)));
 end;
@@ -794,7 +799,7 @@ create procedure pivot(
 	in p_base_cols 		varchar(100),	-- column(s) on the left, separated by commas
 	in p_pivot_col 		varchar(64),	-- name of column to put across the top
 	in p_tally_rtn		varchar(64),	-- aggregation routine ('sum' or 'count', usually)
-	in p_tally_col 		varchar(64),	-- name of column to aggregate
+	in p_tally_col 		varchar(64),	-- name of column to aggregate (ie, the column summed or counted, usually)
 	in p_where		varchar(100)	-- empty string or "WHERE ..."
 	-- , in p_order_by 		varchar(100)	-- empty string or "ORDER BY ..."; usually the base_cols
     )
@@ -815,7 +820,7 @@ begin
 	set p_where =  ifnull(p_where,'');
 	-- set p_order_by =  ifnull(p_order_by,'');
 
-	if (p_tally_rtn = 'sum' or p_tally_rtn = 'count')
+	if p_tally_rtn = 'sum' 
 	then
 		set l_default = '0';
 	end if;
@@ -962,7 +967,7 @@ begin
 		or p_field is null
 		or not exists_field(concat(l_table, '.extension'))
 	then
-		call log(concat('ERROR: function put_extension (', ifnull(p_field, 'NULL'), ') requires non-null id and field'));
+		call log(concat('ERROR: function post_extension (', ifnull(p_field, 'NULL'), ') requires non-null id and field'));
 		return false;
 	end if;
 
@@ -1167,6 +1172,7 @@ begin
 	-- call log('DEBUG : END put_extension');
 	if exists_extension(p_id, p_field)
 	then
+		call log(concat('WARNING: function put_extension updated ', l_table, ' record:"', p_id, '" field:"', ifnull(p_field, 'NULL'), '" to value:"', ifnull(p_value, 'NULL'), '".' ));
 		return true;
 	end if;
 	call log(concat('ERROR: function put_extension failed: p_id="', ifnull(p_id, 'NULL'), '", p_field="', ifnull(p_field, 'NULL'), '", p_value="', ifnull(p_value, 'NULL'), '".'));
@@ -1315,12 +1321,16 @@ create table if not exists relation
 	type			varchar(100)	character set utf8 not null, 
 	major			binary(16)	not null,
 	minor			binary(16)	not null,
+	valid_from		timestamp	null default null, -- not all relationships are eternal
+	valid_to		timestamp	null default null,
 	timestamp_created	timestamp	default current_timestamp,
 	timestamp_updated	timestamp	null default null on update current_timestamp,
 	primary key (type, major, minor),
 	index (type),
 	index (major),
-	index (minor)
+	index (minor),
+	index (valid_from),
+	index (valid_to)
 );
 //
 set @table_count = ifnull(@table_count,0) + 1;
@@ -1370,21 +1380,21 @@ begin
 	-- attempt to force uuid ordering (person, organisation, event, place, category)
 	-- note that its legal to add person-person, event-event relations etc, and these can be in any order
 	case l_exists_major
-	when 'person' 		then set l_major_order = 1;
-	when 'organisation' 	then set l_major_order = 2;
-	when 'event' 		then set l_major_order = 3;
-	when 'place' 		then set l_major_order = 4;
-	when 'category' 	then set l_major_order = 5;
-	else set l_major_order = 6;
+		when 'person' 		then set l_major_order = 1;
+		when 'organisation' 	then set l_major_order = 2;
+		when 'event' 		then set l_major_order = 3;
+		when 'place' 		then set l_major_order = 4;
+		when 'category' 	then set l_major_order = 5;
+		else set l_major_order = 6;
 	end case;
 
 	case l_exists_minor
-	when 'person' 		then set l_minor_order = 1;
-	when 'organisation' 	then set l_minor_order = 2;
-	when 'event' 		then set l_minor_order = 3;
-	when 'place' 		then set l_minor_order = 4;
-	when 'category' 	then set l_minor_order = 5;
-	else set l_minor_order = 6;
+		when 'person' 		then set l_minor_order = 1;
+		when 'organisation' 	then set l_minor_order = 2;
+		when 'event' 		then set l_minor_order = 3;
+		when 'place' 		then set l_minor_order = 4;
+		when 'category' 	then set l_minor_order = 5;
+		else set l_minor_order = 6;
 	end case;
 
 	-- if new.major has a higher order (ie, it should come later), then swap
@@ -1571,6 +1581,7 @@ set @function_count = ifnull(@function_count,0) + 1;
 
 -- delete relationship (NOT both ways; ie, only if ordering of major & minor is right)
 -- rtns true if nothing to delete 
+-- NOTE: you call delete *all* p_major relationships id p_minor is NULL
 drop function if exists delete_relation;
 //
 create function delete_relation
@@ -1628,7 +1639,306 @@ begin
 	end if;
 
 	-- call log('DEBUG : END delete_relation');
+end;
+//
+set @function_count = ifnull(@function_count,0) + 1;
+//
 
+
+--- ATTRIBUTE ---
+-- place to store complex extensions to other tables
+-- for example a PLACE (in place table) may have multiple population values (one for each year, gender, age range etc) 
+-- but place table extension (blob) field is too difficult to use to store such complex data
+-- no need to link via relationship table; never many-many, attribute is always only ONE record
+
+create table if not exists attribute
+(
+	record_id		binary(16)	not null,				-- pk of record to which this attribute is an extension
+	type			varchar(64)	character set utf8 not null, 		-- grouping of data 'population' etc
+	field_name		varchar(64)	character set utf8 not null,		-- name of the 'field' associated with record
+	field_value		text		character set utf8,			-- value in the 'field'
+	timestamp_created	timestamp	default current_timestamp,
+	timestamp_updated	timestamp	null default null on update current_timestamp,
+	primary key (type, record_id, field_name),
+	index (type),
+	index (record_id),
+	index (field_name)
+);
+//
+set @table_count = ifnull(@table_count,0) + 1;
+//
+
+drop trigger if exists attribute_insert;
+//
+create trigger attribute_insert 
+	before insert on attribute
+	for each row
+begin
+	declare l_exists	varchar(64)	default null;
+	declare l_err_msg1	text 		default 'Attempt to insert reference to non-existent record into attribute table.';
+	declare l_err_msg2	text 		default 'Attempt to insert attribute with null record_id or field_name';
+
+	if 	(new.record_id is null or length(trim(new.record_id)) = 0)
+		and
+		(new.field_name is null or length(trim(new.field_name)) = 0)
+	then
+		call log(concat('ERROR : [45000] : ', l_err_msg2 ));
+		SIGNAL SQLSTATE '45000'
+			set MESSAGE_TEXT = l_err_msg;
+	end if;
+
+	set l_exists = exists_uuid(hex(new.record_id));
+
+	-- if record doesn't exists, return error
+	if l_exists is null
+	then
+		call log(concat('ERROR : [45000] : ', l_err_msg1 ));
+		SIGNAL SQLSTATE '45000'
+			set MESSAGE_TEXT = l_err_msg1;
+	end if;
+
+	set new.type = regexp_replace(trim(lower(ifnull(new.type, 'default'))),' +' ,'-' );
+	set new.field_name = regexp_replace(trim(lower(new.field_name)),' +' ,'-' );
+	set new.field_value = trim(new.field_value);
+
+end;
+//
+set @trigger_count = ifnull(@trigger_count,0) + 1;
+//
+
+drop trigger if exists attribute_update;
+//
+create trigger attribute_update 
+	before update on attribute
+	for each row
+begin
+	declare l_exists	varchar(64)	default null;
+	declare l_err_msg1	text 		default 'Attempt to insert reference to non-existent record into attribute table.';
+
+	set l_exists = exists_uuid(hex(new.record_id));
+
+	-- if record doesn't exists, return error
+	if l_exists is null
+	then
+		call log(concat('ERROR : [45000] : ', l_err_msg1 ));
+		SIGNAL SQLSTATE '45000'
+			set MESSAGE_TEXT = l_err_msg1;
+	end if;
+end;
+//
+set @trigger_count = ifnull(@trigger_count,0) + 1;
+//
+
+drop function if exists exists_attribute;
+//
+create function exists_attribute
+(
+	p_record_id	char(32),
+	p_type		varchar(64),
+	p_field_name	varchar(64)
+)
+returns boolean
+begin
+	declare	l_exists	boolean default false;
+
+	-- call log('DEBUG : START exists_attribute');
+
+	set p_type = regexp_replace(trim(lower(ifnull(p_type, 'default'))),' +' ,'-' );
+	set p_record_id = trim(p_record_id);
+	set p_field_name = regexp_replace(trim(lower(p_field_name)),' +' ,'-' );
+
+	if 	p_record_id is null
+	then
+		call log('ERROR: function exists_attribute requires record id');
+		return null;
+	end if;
+
+	select 	if(count(*) > 0, true, false)
+	into 	l_exists
+	from 	attribute
+	where 	record_id = unhex(p_record_id)
+		and if(p_type is null, 'null', type) = ifnull(p_type, 'null')
+		and if(p_field_name is null, 'null', field_name) = ifnull(p_field_name, 'null');
+
+	-- call log('DEBUG : END exists_attribute');
+	return l_exists;
+end;
+//
+set @function_count = ifnull(@function_count,0) + 1;
+//
+
+drop function if exists get_attribute;
+//
+create function get_attribute
+(
+	p_record_id	char(32),
+	p_type		varchar(64),
+	p_field_name	varchar(64)
+)
+returns text
+begin
+	declare	l_text		text default null;
+
+	-- call log('DEBUG : START get_attribute');
+
+	set p_type = regexp_replace(trim(lower(ifnull(p_type, 'default'))),' +' ,'-' );
+	set p_record_id = trim(p_record_id);
+	set p_field_name = regexp_replace(trim(lower(p_field_name)),' +' ,'-' );
+
+	if 	p_record_id is null or
+		p_field_name is null
+	then
+		call log('ERROR: function get_attribute requires record id and field name');
+		return null;
+	end if;
+
+	-- get latest value (although PK means there should only ever be one anyway)
+	select 	field_value
+	into 	l_text
+	from 	attribute
+	where 	record_id = unhex(p_record_id)
+		and type = p_type
+		and field_name = p_field_name
+	order by ifnull(timestamp_updated, timestamp_created) desc
+	limit 1;
+
+	-- call log('DEBUG : END get_attribute');
+	return trim(ifnull(l_text, ''));
+end;
+//
+set @function_count = ifnull(@function_count,0) + 1;
+//
+
+drop function if exists post_attribute;
+//
+create function post_attribute
+(
+	p_record_id	char(32),
+	p_type		varchar(64),
+	p_field_name	varchar(64),
+	p_field_value	text
+)
+returns boolean
+begin
+	-- call log('DEBUG : START post_attribute');
+
+	set p_type = regexp_replace(trim(lower(ifnull(p_type, 'default'))),' +' ,'-' );
+	set p_record_id = trim(p_record_id);
+	set p_field_name = regexp_replace(trim(lower(p_field_name)),' +' ,'-' );
+	set p_field_value = trim(p_field_value);
+
+	if 	p_record_id is null or
+		exists_uuid(p_record_id) is null or
+		p_field_name is null
+	then
+		call log('ERROR: function post_attribute requires valid record id and field name');
+		return false;
+	end if;
+
+	if exists_attribute(p_record_id, p_type, p_field_name)
+	then
+		call log(concat('WARNING: function post_attribute attempted duplicate insertion: p_type="', ifnull(p_type, 'NULL'), '", p_record_id="', ifnull(p_record_id, 'NULL'), '", p_field_name="', ifnull(p_field_name, 'NULL'), '".'));
+	else
+		insert into attribute (type, record_id, field_name, field_value)
+		values (p_type, unhex(p_record_id), p_field_name, p_field_value);	
+	end if;
+
+	-- call log('DEBUG : END post_attribute');
+	if exists_attribute(p_record_id, p_type, p_field_name)
+	then
+		return true;	
+	end if;
+	call log(concat('ERROR: function post_attribute failed: p_type="', ifnull(p_type, 'NULL'), '", p_record_id="', ifnull(p_record_id, 'NULL'), '", p_field_name="', ifnull(p_field_name, 'NULL'), '".'));
+	return false;
+end;
+//
+set @function_count = ifnull(@function_count,0) + 1;
+//
+
+drop function if exists put_attribute;
+//
+create function put_attribute
+(
+	p_record_id	char(32),
+	p_type		varchar(64),
+	p_field_name	varchar(64),
+	p_field_value	text
+)
+returns boolean
+begin
+
+	-- call log('DEBUG : START put_attribute');
+	set p_type = regexp_replace(trim(lower(ifnull(p_type, 'default'))),' +' ,'-' );
+	set p_record_id = trim(p_record_id);
+	set p_field_name = regexp_replace(trim(lower(p_field_name)),' +' ,'-' );
+	set p_field_value = trim(p_field_value);
+
+	if 	p_record_id is null or
+		p_field_name is null
+	then
+		call log('ERROR: function put_attribute requires record id and field name');
+		return false;
+	end if;
+
+	if exists_attribute(p_record_id, p_type, p_field_name)
+	then
+		update attribute 
+			set field_value = p_field_value
+		where	record_id =  unhex(p_record_id)
+			and field_name = p_field_name
+			and type = p_type;
+	
+		-- call log('DEBUG : END put_attribute');
+		if get_attribute(p_record_id, p_type, p_field_name) = p_field_value
+		then
+			call log(concat('WARNING: function put_attribute updated record:"', p_record_id, '" type:"',  ifnull(p_type, 'NULL'),'" field:"', ifnull(p_field_name, 'NULL'), '" to value "', ifnull(p_field_value, 'NULL'), '".' ));
+			return true;	
+		end if;
+	end if;
+
+	call log(concat('ERROR: function put_attribute failed: p_type="', ifnull(p_type, 'NULL'), '", p_record_id="', ifnull(p_record_id, 'NULL'), '", p_field_name="', ifnull(p_field_name, 'NULL'), '".'));
+	return false;
+end;
+//
+set @function_count = ifnull(@function_count,0) + 1;
+//
+
+
+drop function if exists delete_attribute;
+//
+create function delete_attribute
+(
+	p_record_id	char(32),
+	p_type		varchar(64),
+	p_field_name	varchar(64)
+)
+returns boolean
+begin
+	-- call log('DEBUG : START delete_attribute');
+
+	set p_type = regexp_replace(trim(lower(p_type)),' +' ,'-' );
+	set p_record_id = trim(p_record_id);
+	set p_field_name = regexp_replace(trim(lower(p_field_name)),' +' ,'-' );
+
+	if 	p_record_id is null
+	then
+		call log('ERROR: function delete_attribute requires at least a record id');
+		return false;
+	end if;
+
+	delete
+	from 	attribute
+	where	record_id = unhex(p_record_id)
+		and if(p_type is null, 'null', type) = ifnull(p_type, 'null')
+		and if(p_field_name is null, 'null', field_name) = ifnull(p_field_name, 'null');
+
+	-- call log('DEBUG : END delete_attribute');
+	if not exists_attribute(p_record_id, p_type, p_field_name)
+	then
+		return true;	
+	end if;
+	call log(concat('ERROR: function delete_attribute failed: p_type="', ifnull(p_type, 'NULL'), '", p_record_id="', ifnull(p_record_id, 'NULL'), '", p_field_name="', ifnull(p_field_name, 'NULL'), '".'));
+	return false;
 end;
 //
 set @function_count = ifnull(@function_count,0) + 1;
@@ -1913,7 +2223,7 @@ create function post_category
 (
 	p_type			varchar(50),
 	p_identifier		varchar(100),
-	p_name			varchar(100),
+	p_name			varchar(500),
 	p_description		text
 )
 returns char(32)
@@ -2027,6 +2337,7 @@ begin
 	-- call log('DEBUG : END put_category');
 	if exists_category(p_field, p_value)
 	then
+		call log(concat('WARNING: function put_category updated record:"', p_id, '" field:"', ifnull(l_field, 'NULL'), '" to value:"', ifnull(p_value, 'NULL'), '".' ));
 		return true;
 	end if;
 	call log(concat('ERROR: function put_category failed: p_id="', ifnull(p_id, 'NULL'), '", p_field="', ifnull(p_field, 'NULL'), '", p_value="', ifnull(p_value, 'NULL'),'".'));
@@ -2088,7 +2399,9 @@ create table if not exists person
 	primary key (id),
 	index (type),
 	index (identifier),
-	index (name)
+	index (name),
+	index (role),
+	index (gender)
 );
 //
 set @table_count = ifnull(@table_count,0) + 1;
@@ -2142,8 +2455,8 @@ create trigger person_delete
 	after delete on person
 	for each row
 begin
-	delete from relation
-	where major = old.id or minor = old.id;
+	delete from relation	where major = old.id or minor = old.id;
+	delete from attribute	where record_id = old.id;
 end;
 //
 set @trigger_count = ifnull(@trigger_count,0) + 1;
@@ -2372,7 +2685,7 @@ create function post_person
 (
 	p_type			varchar(50),
 	p_identifier		varchar(100),
-	p_name			varchar(100),
+	p_name			varchar(500),
 	p_description		text,
 	p_role			varchar(100),
 	p_gender		varchar(10)
@@ -2489,6 +2802,7 @@ begin
 	-- call log('DEBUG : END put_person');
 	if exists_person(p_field, p_value)
 	then
+		call log(concat('WARNING: function put_person updated record:"', p_id, '" field:"', ifnull(l_field, 'NULL'), '" to value:"', ifnull(p_value, 'NULL'), '".' ));
 		return true;
 	end if;
 	call log(concat('ERROR: function put_person failed: p_id="', ifnull(p_id, 'NULL'), '", p_field="', ifnull(p_field, 'NULL'), '", p_value="', ifnull(p_value, 'NULL'), '".'));
@@ -2596,16 +2910,14 @@ create trigger organisation_delete
 	after delete on organisation
 	for each row
 begin
-
-	delete from relation
-	where major = old.id or minor = old.id;
-
+	delete from relation	where major = old.id or minor = old.id;
+	delete from attribute	where record_id = old.id;
 end;
 //
 set @trigger_count = ifnull(@trigger_count,0) + 1;
 //
 
--- returns t/f if person record exists where p_field=p_value
+-- returns t/f if organisation record exists where p_field=p_value
 drop function if exists exists_organisation;
 //
 create function exists_organisation
@@ -2672,7 +2984,7 @@ end;
 set @function_count = ifnull(@function_count,0) + 1;
 //
 
--- returns JSON string array representing person record2 where p_field = p_value
+-- returns JSON string array representing organisation record2 where p_field = p_value
 drop function if exists get_organisation;
 //
 create function get_organisation
@@ -2806,14 +3118,14 @@ end;
 set @function_count = ifnull(@function_count,0) + 1;
 //
 
--- adds a new person record (and returns its PK)
+-- adds a organisation record (and returns its PK)
 drop function if exists post_organisation;
 //
 create function post_organisation
 (
 	p_type			varchar(50),
 	p_identifier		varchar(100),
-	p_name			varchar(100),
+	p_name			varchar(500),
 	p_description		text
 )
 returns char(32)
@@ -2871,7 +3183,7 @@ end;
 set @function_count = ifnull(@function_count,0) + 1;
 //
 
--- updates a new person record (and returns t/f)
+-- updates a organisation record (and returns t/f)
 -- doesnt manage contact dynamic fields
 drop function if exists put_organisation;
 //
@@ -2926,6 +3238,7 @@ begin
 	-- call log('DEBUG : END put_organisation');
 	if exists_organisation(p_field, p_value)
 	then
+		call log(concat('WARNING: function put_organisation updated record:"', p_id, '" field:"', ifnull(l_field, 'NULL'), '" to value:"', ifnull(p_value, 'NULL'), '".' ));
 		return true;
 	end if;
 	call log(concat('ERROR: function put_organisation failed: p_id="', ifnull(p_id, 'NULL'), '", p_field="', ifnull(p_field, 'NULL'), '", p_value="', ifnull(p_value, 'NULL'), '".'));
@@ -2986,6 +3299,7 @@ create table if not exists event
 	index (identifier),
 	index (name),
 	index (date_event),
+	index (date_resolution),
 	index (timestamp_created)
 );
 //
@@ -3048,8 +3362,8 @@ create trigger event_delete
 	after delete on event
 	for each row
 begin
-	delete from relation
-	where major = old.id or minor = old.id;
+	delete from relation	where major = old.id or minor = old.id;
+	delete from attribute	where record_id = old.id;
 end;
 //
 set @trigger_count = ifnull(@trigger_count,0) + 1;
@@ -3317,7 +3631,7 @@ create function post_event
 (
 	p_type			varchar(50),
 	p_identifier		varchar(100),
-	p_name			varchar(100),
+	p_name			varchar(500),
 	p_description		text,
 	p_date_event		varchar(20), -- expects datetime string 'YYYY-MM-DD HH:MI:SS' or date string 'YYYY-MM-DD'
 	p_date_resolution	varchar(50) -- '%Y-%m-%d' etc
@@ -3459,6 +3773,7 @@ begin
 	-- call log('DEBUG : END put_event');
 	if exists_event(p_field, p_value)
 	then
+		call log(concat('WARNING: function put_event updated record:"', p_id, '" field:"', ifnull(l_field, 'NULL'), '" to value:"', ifnull(p_value, 'NULL'), '".' ));
 		return true;
 	end if;
 	call log(concat('ERROR: function put_event failed: p_id="', ifnull(p_id, 'NULL'), '", p_field="', ifnull(p_field, 'NULL'), '", p_value="', ifnull(p_value, 'NULL'), '".'));
@@ -3842,6 +4157,7 @@ begin
 		set new.centre_point = convert_xy_to_point(new.longitude, new.latitude);
 	end if;	
 
+	-- update mbr, centre and lat/long if new polygon entered
 	if new.polygon is not null
 	then
 		set new.mbr_polygon = st_envelope(new.polygon);
@@ -3852,6 +4168,35 @@ begin
 			set new.latitude = substring_index(substring_index(substring_index(ST_AsText(new.centre_point), '(', -1), ')', 1), ' ', -1);
 		end if;
 	end if;
+
+	-- update mbr, centre and lat/long if new line entered
+	if new.line is not null
+	then
+		set new.polygon = st_convexhull(new.line);		
+		set new.mbr_polygon = st_envelope(new.polygon);
+		if new.centre_point is null
+		then
+			set new.centre_point = st_centroid(new.polygon);
+			set new.longitude = substring_index(substring_index(substring_index(ST_AsText(new.centre_point), '(', -1), ')', 1), ' ', 1);
+			set new.latitude = substring_index(substring_index(substring_index(ST_AsText(new.centre_point), '(', -1), ')', 1), ' ', -1);
+		end if;
+	end if;
+
+	-- update mbr, centre and lat/long if new centrepoint entered
+/*	if new.centre_point is not null
+	then	
+		if new.polygon is null
+		then
+			set new.polygon = st_convexhull(new.centre_point);	
+		end if;
+		if new.mbr_polygon is null
+		then	
+			set new.mbr_polygon = st_envelope(new.polygon);
+		end if;
+		set new.longitude = substring_index(substring_index(substring_index(ST_AsText(new.centre_point), '(', -1), ')', 1), ' ', 1);
+		set new.latitude = substring_index(substring_index(substring_index(ST_AsText(new.centre_point), '(', -1), ')', 1), ' ', -1);
+	end if;
+*/
 end;
 //
 set @trigger_count = ifnull(@trigger_count,0) + 1;
@@ -3961,16 +4306,47 @@ begin
 		set new.centre_point = convert_xy_to_point(new.longitude, new.latitude);
 	end if;	
 
+	-- update mbr, centre and lat/long if new polygon entered
 	if new.polygon is not null
 	then
-		set new.mbr_polygon = ST_Envelope(new.polygon);
+		set new.mbr_polygon = st_envelope(new.polygon);
 		if new.centre_point is null
 		then
-			set new.centre_point = ST_Centroid(new.polygon);
+			set new.centre_point = st_centroid(new.polygon);
 			set new.longitude = substring_index(substring_index(substring_index(ST_AsText(new.centre_point), '(', -1), ')', 1), ' ', 1);
 			set new.latitude = substring_index(substring_index(substring_index(ST_AsText(new.centre_point), '(', -1), ')', 1), ' ', -1);
 		end if;
 	end if;
+
+	-- update mbr, centre and lat/long if new line entered
+	if new.line is not null
+	then
+		set new.polygon = st_convexhull(new.line);		
+		set new.mbr_polygon = st_envelope(new.polygon);
+		if new.centre_point is null
+		then
+			set new.centre_point = st_centroid(new.polygon);
+			set new.longitude = substring_index(substring_index(substring_index(ST_AsText(new.centre_point), '(', -1), ')', 1), ' ', 1);
+			set new.latitude = substring_index(substring_index(substring_index(ST_AsText(new.centre_point), '(', -1), ')', 1), ' ', -1);
+		end if;
+	end if;
+
+	-- update mbr, centre and lat/long if new centrepoint entered
+/*
+	if new.centre_point is not null
+	then	
+		if new.polygon is null
+		then
+			set new.polygon = st_convexhull(new.centre_point);	
+		end if;
+		if new.mbr_polygon is null
+		then	
+			set new.mbr_polygon = st_envelope(new.polygon);
+		end if;
+		set new.longitude = substring_index(substring_index(substring_index(ST_AsText(new.centre_point), '(', -1), ')', 1), ' ', 1);
+		set new.latitude = substring_index(substring_index(substring_index(ST_AsText(new.centre_point), '(', -1), ')', 1), ' ', -1);
+	end if;
+*/
 end;
 //
 set @trigger_count = ifnull(@trigger_count,0) + 1;
@@ -3982,8 +4358,8 @@ create trigger place_delete
 	after delete on place
 	for each row
 begin
-	delete from relation
-	where major = old.id or minor = old.id;
+	delete from relation	where major = old.id or minor = old.id;
+	delete from attribute	where record_id = old.id;
 end;
 //
 set @trigger_count = ifnull(@trigger_count,0) + 1;
@@ -4107,7 +4483,8 @@ create function convert_xy_to_point
 		p_x	float, 	
 		p_y	float
 	)
-	returns geometry
+returns geometry
+deterministic
 begin
 	declare l_text text;
 
@@ -4120,6 +4497,44 @@ begin
 end;
 //
 set @function_count = ifnull(@function_count,0) + 1;
+//
+
+-- returns distance between 2 points in km
+drop function if exists get_earth_circle_distance;
+//
+create function get_earth_circle_distance
+	(
+		point1 point, 
+		point2 point
+	) 
+returns double
+deterministic
+begin
+  declare lon1, lon2 double;
+  declare lat1, lat2 double;
+  declare td double;
+  declare d_lat double;
+  declare d_lon double;
+  declare a, c, R double;
+
+  set lon1 = X(GeomFromText(AsText(point1)));
+  set lon2 = X(GeomFromText(AsText(point2)));
+  set lat1 = Y(GeomFromText(AsText(point1)));
+  set lat2 = Y(GeomFromText(AsText(point2)));
+
+  set d_lat = radians(lat2 - lat1);
+  set d_lon = radians(lon2 - lon1);
+
+  set lat1 = radians(lat1);
+  set lat2 = radians(lat2);
+
+  set R = 6372.8; -- circumference of earth in kilometers
+
+  set a = sin(d_lat / 2.0) * sin(d_lat / 2.0) + sin(d_lon / 2.0) * sin(d_lon / 2.0) * cos(lat1) * cos(lat2);
+  set c = 2 * asin(sqrt(a));
+
+  return R * c;
+end;
 //
 
 -- returns t/f if place record exists where p_field=p_value
@@ -4217,7 +4632,7 @@ begin
 
 	if 	p_field is not null
 	then
-		-- hard code looking at person table
+		-- hard code looking at place table
 		set l_field = substring_index(p_field, '.' , -1);
 		set p_field = concat('place.', l_field);
 
@@ -4395,7 +4810,7 @@ create function post_place
 (
 	p_type			varchar(50),
 	p_identifier		varchar(100),
-	p_name			varchar(100),
+	p_name			varchar(500),
 	p_description		text, 
 	p_address		varchar(500),
 	p_postcode		varchar(50),
@@ -4485,7 +4900,7 @@ end;
 set @function_count = ifnull(@function_count,0) + 1;
 //
 	
--- updates a new person record (and returns t/f)
+-- updates a place record (and returns t/f)
 drop function if exists put_place;
 //
 create function put_place
@@ -4559,6 +4974,7 @@ begin
 	-- call log('DEBUG : END put_place');
 	if exists_place(p_field, p_value)
 	then
+		call log(concat('WARNING: function put_place updated record:"', p_id, '" field:"', ifnull(l_field, 'NULL'), '" to value:"', ifnull(p_value, 'NULL'), '".' ));
 		return true;
 	end if;
 	call log(concat('ERROR: function put_place failed: p_id="', ifnull(p_id, 'NULL'), '", p_field="', ifnull(p_field, 'NULL'), '", p_value="', ifnull(p_value, 'NULL'), '".'));
@@ -4568,7 +4984,7 @@ end;
 set @function_count = ifnull(@function_count,0) + 1;
 //
 
--- deletes specified record from person table, returns t/f
+-- deletes specified record from place table, returns t/f
 drop function if exists delete_place;
 //
 create function delete_place
@@ -4801,7 +5217,8 @@ create or replace view police_latest_outcome
 as
 	select
 		crime_relation.major		as crime_event_id,
-		max(outcome.timestamp_created)	as "timestamp_created" -- note that this is most recently ADDED record, not the date of the event itself (which may be duplicated)
+		max(outcome.date_event)		as date_event, -- latest record by the date f the event itself
+		max(outcome.timestamp_created)	as "timestamp_created" -- most recently ADDED record, not the date of the event itself (which may be duplicated)
 	from
 		event outcome
 		join relation crime_relation on outcome.id = crime_relation.minor
@@ -4811,7 +5228,9 @@ as
 set @view_count = ifnull(@view_count,0) + 1;
 //
 
--- returns latest (by event.timestamp_created) police outcome 
+-- returns all police outcomes
+-- if you want *latest* police outcomes (ie max 1 per crime rather than n per crime), you need to join thus:
+-- select distinct police_outcome.* from police_outcome join police_latest_outcome on police_outcome.crime_event_id = police_latest_outcome.crime_event_id and  police_outcome.timestamp_created = police_latest_outcome.timestamp_created 
 create or replace view police_outcome
 as
 	select distinct
@@ -4828,7 +5247,9 @@ as
 		event outcome
 		join relation crime_relation			on outcome.id = crime_relation.minor -- OUTCOME event is a minor and CRIME event is a major
 		join event crime				on crime_relation.major = crime.id
-		join police_latest_outcome			on (crime.id = police_latest_outcome.crime_event_id and outcome.timestamp_created = police_latest_outcome.timestamp_created)
+		join police_latest_outcome			on (crime.id = police_latest_outcome.crime_event_id 
+									and outcome.timestamp_created = police_latest_outcome.timestamp_created 
+									and outcome.date_event = police_latest_outcome.date_event )
 		join relation category_relation			on outcome.id = category_relation.major -- OUTCOME event is a major and CATEGORY is a minor
 		join police_outcome_category			on category_relation.minor = police_outcome_category.id
 		left outer join police_criminal		 	on outcome.id = police_criminal.outcome_event_id
@@ -4846,8 +5267,8 @@ as
 		crime.name 						as "persistent_id",
 		date_format(crime.date_event, crime.date_resolution) 	as "month",
 		crime.description					as "context",
-		column_get(crime.extension, 'location_type' as char) 	as "location_type",
-		column_get(crime.extension, 'location_subtype' as char) as "location_subtype",
+		column_get(crime.extension, 'location_type' as char(100)) 	as "location_type",
+		column_get(crime.extension, 'location_subtype' as char(100)) 	as "location_subtype",
 		police_crime_category.code				as "category_code",
 		police_crime_category.name				as "category_name",
 		police_crime_place.place_id				as "place_id",
@@ -4855,14 +5276,14 @@ as
 		police_crime_place.location_name			as "location_name",
 		police_crime_place.location_point			as "location_point",
 		-- police_crime_place.places				as "places",
-		police_outcome.category_name				as "outcome_status",
-		police_outcome.month					as "outcome_date"
+		group_concat(distinct concat(police_outcome.month, ':', police_outcome.category_name))	as "outcome_status" -- group_concat means you cant get duplicate rows for multiple outcomes (irresepctive of whether police_latest_outcome works or not)
 	from	event crime
 		join relation category_relation			on crime.id = category_relation.major 
 		join police_crime_category			on category_relation.minor = police_crime_category.id
 		left outer join police_crime_place		on crime.id = police_crime_place.crime_event_id
 		left outer join police_outcome			on crime.id = police_outcome.crime_event_id
-	where 	crime.type = 'police-crime';
+	where 	crime.type = 'police-crime'
+	group by 1,2,3,4,5,6,7,8,9,10,11,12,13;
 //
 set @view_count = ifnull(@view_count,0) + 1;
 //
@@ -4927,13 +5348,13 @@ as
 		date_format(stop.date_event, stop.date_resolution) 				as "datetime",
 		stop.name									as "stop_name",
 		stop.description								as "legislation",
-		column_get(stop.extension, 'outcome_linked_to_object_of_search' as char)	as "outcome_linked_to_object_of_search",
-		column_get(stop.extension, 'operation' as char)					as "operation",
-		column_get(stop.extension, 'object_of_search' as char)				as "object_of_search",
-		column_get(stop.extension, 'operation_name' as char)				as "operation_name",
-		column_get(stop.extension, 'removal_of_more_than_outer_clothing' as char)	as "removal_of_more_than_outer_clothing",
-		column_get(stop.extension, 'outcome' as char)					as "outcome",
-		column_get(stop.extension, 'involved_person' as char)				as "involved_person",
+		column_get(stop.extension, 'outcome_linked_to_object_of_search' as char(1))	as "outcome_linked_to_object_of_search",
+		column_get(stop.extension, 'operation' as char(1))				as "operation",
+		column_get(stop.extension, 'object_of_search' as char(64))			as "object_of_search",
+		column_get(stop.extension, 'operation_name' as char(64))			as "operation_name",
+		column_get(stop.extension, 'removal_of_more_than_outer_clothing' as char(1))	as "removal_of_more_than_outer_clothing",
+		column_get(stop.extension, 'outcome' as char(64))				as "outcome",
+		column_get(stop.extension, 'involved_person' as char(1))			as "involved_person",
 		police_stop_place.place_id							as "place_id",
 		police_stop_place.location_id							as "location_id",
 		police_stop_place.location_name							as "location_name",
@@ -4954,17 +5375,47 @@ as
 set @view_count = ifnull(@view_count,0) + 1;
 //
 
-create or replace view police_crime_stats
+-- dummy get_population func (fully defined later) to allow population based views to be created
+drop function if exists get_population; //
+create FUNCTION  get_population() returns boolean no sql  begin return false; end; //         
+
+create or replace view police_crime_stats_neighbourhood
+as
+	select 
+		date_format(crime.date_event, crime.date_resolution) as month,
+		police_neighbourhood.name as neighbourhood,
+		category.name as category,
+		count(*) as number
+	from 
+		event crime 
+		join relation category_relation	on crime.id = category_relation.major
+		join category			on category.id = category_relation.minor and category.type = 'police-crime'
+		join relation place_relation	on crime.id = place_relation.major 
+		join place crime_location 	on crime_location.id = place_relation.minor
+		join place region 		on region.type = 'local-authority' 
+							and region.name = get_variable('region')
+							and st_within(crime_location.centre_point, region.polygon) 
+		join place police_neighbourhood	on police_neighbourhood.type = 'police-neighbourhood' 
+							and st_within(crime_location.centre_point, police_neighbourhood.polygon)
+	where 
+		crime.type = 'police-crime' 
+	group by 1,2,3;
+//
+set @view_count = ifnull(@view_count,0) + 1;
+//
+
+create or replace view police_crime_stats_ward
 as
 	select 
 		date_format(crime.date_event, crime.date_resolution) as month,
 		ward.name as ward,
 		category.name as category,
 		count(*) as number
+		-- ((count(*) * 1000)/get_population(ward.name, 'ward', date_format(crime.date_event, '%Y'), null, null)) as "crime_rate per 1000 people" -- v slow
 	from 
 		event crime 
 		join relation category_relation	on crime.id = category_relation.major
-		join category			on category.id = category_relation.minor
+		join category			on category.id = category_relation.minor and category.type = 'police-crime'
 		join relation place_relation	on crime.id = place_relation.major 
 		join place crime_location 	on crime_location.id = place_relation.minor
 		join place region 		on region.type = 'local-authority' 
@@ -4974,44 +5425,58 @@ as
 							and st_within(crime_location.centre_point, ward.polygon)
 	where 
 		crime.type = 'police-crime' 
-	group by month, ward, category;
+	group by 1,2,3;
 //
 set @view_count = ifnull(@view_count,0) + 1;
 //
 
---specialised views
--- example - a view of crimes in any ward called 'katesgrove'
--- to obtain cat/month grid : call pivot('police_katesgrove_crimes', 'month', 'category_name', 'count', 'crime_event_id', null, null)
-/*create view police_katesgrove_crimes 
-AS 
-SELECT distinct
-	place.type, 
-	place.name, 
-	police_crime.*,
-	police_criminal.person_identifier
-FROM 
-	police_crime 
-	join place on (place.polygon is not null and st_within(police_crime.location_point, place.polygon)) 
-	left outer join police_criminal on police_crime.crime_event_id = police_criminal.crime_event_id
-WHERE
-	place.name = 'Katesgrove' and place.type = 'ward';
+create or replace view police_outcome_stats_ward
+as
+	select 
+		date_format(crime.date_event, crime.date_resolution) as month,
+		ward.name as ward,
+		ifnull(police_outcome.category_name, 'No outcome') as outcome,
+		count(*) as number
+	from
+		event crime
+		join relation place_relation			on crime.id = place_relation.major 
+		join place crime_location 			on crime_location.id = place_relation.minor
+		join place region 				on region.type = 'local-authority' 
+									and region.name = get_variable('region')
+									and st_within(crime_location.centre_point, region.polygon) 
+		join place ward 				on ward.type = 'ward' 
+									and st_within(crime_location.centre_point, ward.polygon)
+		left outer join police_outcome on crime.id = police_outcome.crime_event_id
+	where 
+		crime.type = 'police-crime' 
+	group by 1,2,3;
+//
+set @view_count = ifnull(@view_count,0) + 1;
 //
 
-create view police_minster_katesgrove_crimes 
-AS 
-SELECT distinct
-	place.type, 
-	place.name, 
-	police_crime.*,
-	police_criminal.person_identifier
-FROM 
-	police_crime 
-	join place on (place.polygon is not null and st_within(police_crime.location_point, place.polygon)) 
-	left outer join police_criminal on police_crime.crime_event_id = police_criminal.crime_event_id
-WHERE
-	place.name like '%Katesgrove%' and place.type = 'police-neighbourhood';
+create or replace view police_outcome_stats_neighbourhood
+as
+	select 
+		date_format(crime.date_event, crime.date_resolution) as month,
+		police_neighbourhood.name as neighbourhood,
+		ifnull(police_outcome.category_name, 'No outcome') as outcome,
+		count(*) as number
+	from
+		event crime
+		join relation place_relation			on crime.id = place_relation.major 
+		join place crime_location 			on crime_location.id = place_relation.minor
+		join place region 				on region.type = 'local-authority' 
+									and region.name = get_variable('region')
+									and st_within(crime_location.centre_point, region.polygon) 
+		join place police_neighbourhood	on police_neighbourhood.type = 'police-neighbourhood' 
+							and st_within(crime_location.centre_point, police_neighbourhood.polygon)
+		left outer join police_outcome on crime.id = police_outcome.crime_event_id
+	where 
+		crime.type = 'police-crime' 
+	group by 1,2,3;
 //
-*/
+set @view_count = ifnull(@view_count,0) + 1;
+//
 
 -- POLICE DATA MANIPULATION FUNCTIONS -- 
 
@@ -5077,274 +5542,6 @@ end;
 set @function_count = ifnull(@function_count,0) + 1;
 //
 
--- POLICE OUTCOME --
-/*
- {
-        "category": {
-            "code": "imprisoned",
-            "name": "Offender sent to prison"
-        },
-        "date": "2013-01",
-        "person_id": 7508313,
-        "crime": {
-            "category": "violent-crime",
-            "location_type": "Force",
-            "location_subtype": "",
-            "persistent_id": "5ae43b96a401aea27b4a82898652f6fd88354115d20fdb8bbfaf5b16da2ff9f8",
-            "month": "2012-01",
-            "location": {
-                "latitude": 52.63447444219649,
-                "street": {
-                    "id": 883498,
-                    "name": "On or near Kate Street"
-                },
-                "longitude": -1.1491966631305148
-            },
-            "context": "",
-            "id": 9723278
-        }
-    }
-*/
-
-drop function if exists post_police_outcome;
-//
-create function post_police_outcome
-(
-	p_category_code		varchar(100),
-	p_category_name		varchar(100),
-	p_month			varchar(10), 	-- this is delivered as 'YYYY-MM' and needs to be converted to 'YYYY-MM-00'
-	p_person_identifier	int,		-- often null
-	p_crime_id		int,		-- link to event.identifier ('crime.id' from API)
-	p_crime_persistent_id	varchar(64) 	-- link to event.name ('crime.persistent_id' from API)
-)
-returns char(32)
-begin
-	declare l_date_format		varchar(5) default '%Y-%m';
-	declare l_crime_event_id	char(32);
-	declare l_outcome_event_id	char(32);
-	declare l_outcome_category_id	char(32);
-	declare l_person_id		char(32);
-	declare l_crime_category_id	char(32);
-	declare l_exists		boolean;
-	declare l_relation		boolean;
-	declare l_person_identifier 		int;
-	declare l_crime_month			varchar(10);
-	declare l_old_crime_persistent_id	varchar(64);
-	declare l_identifier			varchar(100);
-
-	-- call log('DEBUG : START post_police_outcome');
-
-	set p_category_code = lower(trim(p_category_code));
-	set p_category_name = trim(p_category_name);
-	set p_crime_persistent_id = trim(p_crime_persistent_id);
-	set p_month = trim(p_month);
-
-	if	(p_category_code is null and p_category_name is null)
-		or (p_crime_id is null and p_crime_persistent_id is null)
-		or p_month is null
-		or convert_string_to_date(p_month) > now()
-	then
-		call log('ERROR: function post_police_outcome requires non-null category code or name, a past month and crime id or persistent id');
-		return null;
-	end if;
-
-	-- find underlying crime record
-	-- only do stuff if crime_not already posted
-	if p_crime_id is not null
-	then
-		select 	distinct hex(id), date_format(date_event, date_resolution)
-		into 	l_crime_event_id, l_crime_month
-		from	event
-		where	identifier = p_crime_id
-		and	type = 'police-crime';
-	end if;
-
-	-- if you can't find crime_id, check persistent_id instead
-	if p_crime_id is null and p_crime_persistent_id is not null and length(p_crime_persistent_id) > 0
-	then
-		select 	distinct hex(id), date_format(date_event, date_resolution)
-		into 	l_crime_event_id, l_crime_month
-		from	event
-		where	name = p_crime_persistent_id
-		and	type = 'police-crime';
-	end if;
-
-	-- call log(concat('DEBUG : l_crime_event_id = ', ifnull(l_crime_event_id, 'NULL') ));
-
-	-- can only meaningfully add outcomes to existing crimes dated before the outcome
-	-- noticed that outcome data sometimes comes before crime data in police data stream. Not sure what that means.
-	if l_crime_event_id is null -- or convert_string_to_date(l_crime_month) > convert_string_to_date(p_month)
-	then
-		-- call log(concat('ERROR: function post_police_outcome can only add outcomes to pre-existing crimes. Crime (police) ID "', ifnull(p_crime_id,'NULL'), '" or crime identifier "',  ifnull(p_crime_persistent_id, 'NULL'), '" does not exist.'));
-		-- return null;
-
-		-- log category
-		select 	hex(id)
-		into 	l_crime_category_id
-		from 	category
-		where 	identifier = 'unknown'
-		and	type = 'police-crime'
-		limit 1;
-
-		if l_crime_category_id is null
-		then	
-			set l_crime_category_id = post_category(
-				'police-crime',
-				'unknown',
-				'unknown',
-				null
-				);
-		end if;
-
-		-- add skeletal dummy crime record (that will, with luck, be updated with the real crime later)
-		set l_crime_event_id = post_event(
-				'police-crime',
-				p_crime_id,
-				p_crime_persistent_id,
-				null,
-				p_month,
-				l_date_format
-				);
-
-		set l_relation = post_relation(null, l_crime_event_id, l_crime_category_id);
-
-	else
-		-- set crime_id or persistent_id where one or the other was null
-		select 	identifier, name
-		into 	p_crime_id, p_crime_persistent_id
-		from	event
-		where 	id = unhex(l_crime_event_id);
-	end if;
-
-	-- post category if not already there
-	select 	hex(id)
-	into 	l_outcome_category_id
-	from 	police_outcome_category
-	where 	code = p_category_code or name = p_category_name
-	limit 1;
-
-	if l_outcome_category_id is null
-	then	
-		set l_outcome_category_id = post_category(
-			'police-crime-outcome',
-			p_category_code,
-			p_category_name,
-			null
-			);
-	end if;
-
-	-- artificial (event) identifier (a checksum intended to be unique for the given variables)
-	set l_identifier = md5(concat( ifnull(p_crime_id, 'NULL'), '-', ifnull(p_category_code, 'NULL'), '-', ifnull(p_month, 'NULL') ));
-
-	-- check if outcome of this category has already been logged for that month
-	select	distinct 
-		hex(id)
-	into	l_outcome_event_id
-	from	event
-	where	type = 'police-crime-outcome'
-		and identifier = l_identifier
-	limit 1;
-
-	if l_outcome_event_id is null
-	then
-		-- post basic outcome record
-		set l_outcome_event_id = post_event(
-				'police-crime-outcome',
-				l_identifier,
-				concat( ifnull(p_crime_id, 'NULL'), '-', ifnull(p_category_code, 'NULL'), '-', ifnull(p_month, 'NULL') ),
-				null,
-				p_month,
-				l_date_format
-				);
-		-- call log(concat('DEBUG : l_outcome_event_id = ', ifnull(l_outcome_event_id, 'NULL') ));
-
-		-- link to crime and category record
-		if l_outcome_event_id is not null
-		then
-			set l_relation = post_relation(null, l_crime_event_id, l_outcome_event_id);
-
-			-- post category if not already there
-			select 	hex(id)
-			into 	l_outcome_category_id
-			from 	police_outcome_category
-			where 	code = p_category_code or name = p_category_name
-			limit 1;
-
-			if l_outcome_category_id is null
-			then	
-				set l_outcome_category_id = post_category(
-					'police-crime-outcome',
-					p_category_code,
-					p_category_name,
-					null
-					);
-			end if;
-			-- call log(concat('DEBUG : l_outcome_category_id = ', ifnull(l_outcome_category_id, 'NULL') ));
-
-			-- link to outcome record
-			set l_relation = post_relation(null, l_outcome_event_id, l_outcome_category_id);
-
-		end if;
-
-	-- else
-		-- cater for later amendments
-		-- outcomes are identified by crime, category and date, and change in any one of these is actually a new outcome
-
-		-- if p_crime_persistent_id is not null and l_old_crime_persistent_id != p_crime_persistent_id
-		-- then
-		-- 	set l_exists = put_event(l_outcome_event_id, 'name', p_crime_persistent_id);
-		-- end if;
-
-	end if;
-
-	-- outcome events come from police api crime records (without persons) or from outcome records (with persons)
-	-- call log(concat('DEBUG : p_person_identifier = ', ifnull(p_person_identifier, 'NULL') ));
-	-- call log(concat('DEBUG : l_person_identifier = ', ifnull(l_person_identifier, 'NULL') ));
-	if l_outcome_event_id is not null and p_person_identifier is not null
-	then
-
-		select 	hex(id)
-		into 	l_person_id
-		from 	person
-		where 	identifier = p_person_identifier
-		and 	type = 'police-criminal'
-		limit 1;
-
-		-- call log(concat('DEBUG : l_person_id = ', ifnull(l_person_id, 'NULL') ));
-		if l_person_id is null
-		then
-			set l_person_id = post_person(
-						'police-criminal',
-						p_person_identifier,
-						null,
-						null,
-						null,
-						null
-						);
-		end if;
-
-		-- link person to outcome
-		if not exists_relation(null, l_person_id, l_outcome_event_id)
-		then
-			set l_relation = post_relation(null, l_person_id, l_outcome_event_id);
-		end if;
-
-		-- link person to crime (possibly redundant)
-		if not exists_relation(null, l_person_id, l_crime_event_id)
-		then
-			set l_relation = post_relation(null, l_person_id, l_crime_event_id);
-		end if;
-
-	end if;
-
-	-- call log('DEBUG : END post_police_outcome');
-
-	return l_outcome_event_id;
-end;
-//
-set @function_count = ifnull(@function_count,0) + 1;
-//
-
 
 -- POLICE CRIME --
 /*
@@ -5378,8 +5575,8 @@ create function post_police_crime
 	p_context		text,
 	p_month			varchar(10), 	-- this is delivered as 'YYYY-MM' and needs to be converted to 'YYYY-MM-00'
 
-	p_location_type		varchar(10),
-	p_location_subtype	varchar(10),
+	p_location_type		varchar(100),
+	p_location_subtype	varchar(100),
 	p_location_id		varchar(100),
 	p_location_name		varchar(100),
 	p_location_latitude	float,
@@ -5400,13 +5597,14 @@ begin
 	declare l_extension		boolean;
 	declare l_latitude		float;
 	declare l_longitude		float;
+	declare l_old_crime_id 			int;
 	declare l_old_crime_persistent_id 	varchar(64);
 	declare l_old_month			varchar(10);
 	declare l_old_context			text;
-	declare l_old_location_type		varchar(10);
-	declare l_old_location_subtype		varchar(10);
-	declare l_old_crime_category_id		varchar(100);
-	declare l_old_location_id		varchar(100);
+	declare l_old_location_type		varchar(100);
+	declare l_old_location_subtype		varchar(100);
+	declare l_old_crime_category_id		char(32);
+	declare l_old_place_id			char(32);
 
 	-- call log('DEBUG : START post_police_crime');
 
@@ -5420,9 +5618,9 @@ begin
 	set p_outcome_category_name 	= lower(trim(p_outcome_category_name));
 	set p_outcome_date 		= trim(p_outcome_date);
 
-	if	p_crime_category_code is null
-		or p_month is null
-		or (p_crime_id is null and p_crime_persistent_id is null)
+	if	length(ifnull(p_crime_category_code, '')) = 0
+		or length(ifnull(p_month, '')) = 0
+		or (length(ifnull(p_crime_id, '')) = 0 and length(ifnull(p_crime_persistent_id, '')) = 0)
 		or convert_string_to_date(p_month) > now() 
 	then
 		call log('ERROR: function post_police_crime requires non-null category, month and crime id or persistent id, and must be dated in the past.');
@@ -5514,7 +5712,7 @@ begin
 	-- id 			ID of the crime. This ID only relates to the API, it is NOT a police identifier
 	-- observed that persistent_id is often null before and including 2016-01, but crime_id never is. 2017-10 data loaded 2017-12-16 had same persistent_id but different id from 2017-10 data loaded 2017-12-23
 
-	if p_crime_persistent_id is not null and length(p_crime_persistent_id) > 0
+	if length(ifnull(p_crime_persistent_id, '')) > 0
 	then
 	 	select 	distinct
 			hex(id)
@@ -5527,7 +5725,7 @@ begin
 	end if;
 
 	-- if there is no persistent_id, use crime_id instead
-	if l_event_id is null and p_crime_id is not null and length(p_crime_id) > 0
+	if l_event_id is null and length(ifnull(p_crime_id, '')) > 0
 	then
 		select 	distinct 
 			hex(id)
@@ -5579,71 +5777,111 @@ begin
 		-- get more details about previously added police_crime 
 		select 	distinct 
 			crime.name, 
+			crime.identifier,
 			date_format(crime.date_event, crime.date_resolution),
 			crime.description, 
 			column_get(crime.extension, 'location_type' as char), 
 			column_get(crime.extension, 'location_subtype' as char),
-			police_crime_category.id,
-			place_relation.id
+			hex(category_relation.id),
+			hex(place_relation.id)
 		into 	l_old_crime_persistent_id, 
+			l_old_crime_id,
 			l_old_month,
 			l_old_context, 
 			l_old_location_type, 
 			l_old_location_subtype, 
 			l_old_crime_category_id, 
-			l_old_location_id
+			l_old_place_id
 		from 	event crime
-			join relation category_relation			on crime.id = category_relation.major 
-			join police_crime_category			on category_relation.minor = police_crime_category.id
+        		left outer join (
+				select 	distinct
+					category.id,
+					relation.major
+				from	category
+					join relation 	on category.id = relation.minor
+				where	category.type = 'police-crime') 
+				category_relation
+					on	crime.id = category_relation.major
 			left outer join (
 				select 	distinct
 					place.id,
 					relation.major
-				from
-					place
-					join relation 			on place.id = relation.minor
-				where	place.type = 'police-location') place_relation
-				on	crime.id = place_relation.major
+				from	place
+					join relation 	on place.id = relation.minor
+				where	place.type = 'police-location') 
+				place_relation
+					on	crime.id = place_relation.major
 		where	crime.id = unhex(l_event_id)
 		order by ifnull(crime.timestamp_updated, crime.timestamp_created) desc
 		limit 1;
 
 		-- cater for postdated amendments to crime records
-		if p_crime_category_code is not null and l_old_crime_category_id is not null and l_old_crime_category_id != l_crime_category_id
+
+		-- call log('DEBUG : A');
+		if 	length(ifnull(p_crime_persistent_id, '')) > 0 and p_crime_persistent_id = l_old_crime_persistent_id
+			and ifnull(p_crime_id, 0) > 0 and ifnull(l_old_crime_id, 0) != p_crime_id
 		then
-			set l_relation = delete_relation(null, l_event_id, l_old_crime_category_id);
-			set l_relation = post_relation(null, l_event_id, l_crime_category_id);
+			set l_exists = put_event(l_event_id, 'identifier', p_crime_id);
 		end if;
 
-		if p_location_id is not null and l_old_location_id is not null and l_old_location_id != p_location_id
+		-- call log('DEBUG : B');
+		if p_crime_category_code is not null and ifnull(l_old_crime_category_id, '') != l_crime_category_id
 		then
-			set l_relation = delete_relation(null, l_event_id, l_old_location_id);
-			set l_relation = post_relation(null, l_event_id, l_place_id);
+			-- call log(concat('DEBUG : l_event_id = ', ifnull(l_event_id, 'NULL') ));
+			-- call log(concat('DEBUG : l_old_crime_category_id = ', ifnull(l_old_crime_category_id, 'NULL') ));
+			-- call log(concat('DEBUG : l_crime_category_id = ', ifnull(l_crime_category_id, 'NULL') ));
+			
+			if not exists_relation (null, l_event_id, l_crime_category_id)
+			then
+				if l_old_crime_category_id is not null
+				then
+					set l_relation = delete_relation(null, l_event_id, l_old_crime_category_id);
+				end if;
+				set l_relation = post_relation(null, l_event_id, l_crime_category_id);
+			end if;
 		end if;
 
-		if p_crime_persistent_id is not null and l_old_crime_persistent_id is not null and l_old_crime_persistent_id != p_crime_persistent_id
-		then
-			set l_exists = put_event(l_event_id, 'name', p_crime_persistent_id);
+		-- call log('DEBUG : C');
+		if p_location_id is not null and ifnull(l_old_place_id, '') != l_place_id
+		then	
+			-- call log(concat('DEBUG : l_event_id = ', ifnull(l_event_id, 'NULL') ));
+			-- call log(concat('DEBUG : l_old_place_id = ', ifnull(l_old_place_id, 'NULL') ));
+			-- call log(concat('DEBUG : l_place_id = ', ifnull(l_place_id, 'NULL') ));
+	
+			if not exists_relation (null, l_event_id, l_place_id)
+			then
+				if l_old_place_id is not null
+				then
+					set l_relation = delete_relation(null, l_event_id, l_old_place_id);			
+				end if;
+				set l_relation = post_relation(null, l_event_id, l_place_id);
+			end if;
 		end if;
 
-		if p_context is not null and l_old_context is not null and l_old_context != p_context
+		-- call log('DEBUG : D');
+		if p_context is not null and ifnull(l_old_context, '') != p_context
 		then
 			set l_exists = put_event(l_event_id, 'description', p_context);
 		end if;
 
-		if p_month is not null and l_old_month is not null and l_old_month != p_month
+		-- call log('DEBUG : E');
+		if p_month is not null and ifnull(l_old_month, '') != date_format(p_month, l_date_format)
 		then
+			-- call log(concat('DEBUG : l_old_month = ', ifnull(l_old_month, 'NULL') ));
+			-- call log(concat('DEBUG : date_format(p_month, l_date_format) = ', ifnull(date_format(p_month, l_date_format), 'NULL') ));
 			set l_exists = put_event(l_event_id, 'date_event', p_month);
 		end if;
 
-		if p_location_type is not null and length(p_location_type) > 0 and l_old_location_type is not null and l_old_location_type != p_location_type
+		-- call log('DEBUG : F');
+		if p_location_type is not null and length(p_location_type) > 0 and ifnull(l_old_location_type, '') != p_location_type
 		then
-			set l_extension = post_extension(l_event_id, 'location_type', p_location_type);
+			set l_extension = put_extension(l_event_id, 'location_type', p_location_type);
 		end if;
 
-		if p_location_subtype is not null and length(p_location_subtype) > 0 and l_old_location_subtype is not null and l_old_location_subtype != p_location_subtype
+		-- call log('DEBUG : G');
+		if p_location_subtype is not null and length(p_location_subtype) > 0 and ifnull(l_old_location_subtype, '') != p_location_subtype
 		then
-			set l_extension = post_extension(l_event_id, 'location_subtype', p_location_subtype);
+			set l_extension = put_extension(l_event_id, 'location_subtype', p_location_subtype);
 		end if;
 
 	end if;
@@ -5669,6 +5907,366 @@ end;
 //
 set @function_count = ifnull(@function_count,0) + 1;
 //
+
+-- POLICE OUTCOME --
+/*
+ {
+        "category": {
+            "code": "imprisoned",
+            "name": "Offender sent to prison"
+        },
+        "date": "2013-01",
+        "person_id": 7508313,
+        "crime": {
+            "category": "violent-crime",
+            "location_type": "Force",
+            "location_subtype": "",
+            "persistent_id": "5ae43b96a401aea27b4a82898652f6fd88354115d20fdb8bbfaf5b16da2ff9f8",
+            "month": "2012-01",
+            "location": {
+                "latitude": 52.63447444219649,
+                "street": {
+                    "id": 883498,
+                    "name": "On or near Kate Street"
+                },
+                "longitude": -1.1491966631305148
+            },
+            "context": "",
+            "id": 9723278
+        }
+    }
+*/
+
+drop function if exists post_police_outcome;
+//
+create function post_police_outcome
+(
+	p_category_code		varchar(100),
+	p_category_name		varchar(100),
+	p_month			varchar(10), 	-- this is delivered as 'YYYY-MM' and needs to be converted to 'YYYY-MM-00'
+	p_person_identifier	int,		-- often null
+
+	-- crime record part (only used if p_crime_id or p_crime_persistent_id don't come up with anything)
+	p_crime_category_code	varchar(100),	
+	p_crime_id		int,		-- police API crime_id, not crime_event_id
+	p_crime_persistent_id	varchar(64),	-- link to event.name ('crime.persistent_id' from API)., may be null
+	p_context		text,
+	p_crime_month		varchar(10), 	-- this is delivered as 'YYYY-MM' and needs to be converted to 'YYYY-MM-00'
+
+	p_location_type		varchar(100),
+	p_location_subtype	varchar(100),
+	p_location_id		varchar(100),
+	p_location_name		varchar(100),
+	p_location_latitude	float,
+	p_location_longitude	float
+
+)
+returns char(32)
+begin
+	declare l_date_format			varchar(5) default '%Y-%m';
+	declare l_crime_event_id		char(32);
+	declare l_outcome_event_id		char(32);
+	declare l_outcome_category_id		char(32);
+	declare l_person_id			char(32);
+	declare l_crime_category_id		char(32);
+	declare l_exists			boolean;
+	declare l_relation			boolean;
+	declare l_person_identifier 		int;
+	declare l_crime_month			varchar(10);
+	declare l_old_crime_persistent_id	varchar(64);
+	declare l_identifier			varchar(500);
+
+	-- call log('DEBUG : START post_police_outcome');
+
+	set p_category_code = lower(trim(p_category_code));
+	set p_category_name = trim(p_category_name);
+	set p_crime_category_code = trim(p_crime_category_code);
+	set p_crime_persistent_id = trim(p_crime_persistent_id);
+	set p_month = trim(p_month);
+	set p_crime_month = trim(p_crime_month);
+	set p_location_type = trim(p_location_type);
+	set p_location_subtype = trim(p_location_subtype);
+	set p_location_id = trim(p_location_id);
+	set p_location_name = trim(p_location_name);
+
+	if	(length(ifnull(p_category_code, '')) = 0 and length(ifnull(p_category_name, '')) = 0 )
+		or length(ifnull(p_month, '')) = 0
+		or (length(ifnull(p_crime_id, '')) = 0 and length(ifnull(p_crime_persistent_id, '')) = 0)
+		or convert_string_to_date(p_month) > now()
+	then
+		call log('ERROR: function post_police_outcome requires non-null category code or name, a past month and crime id or persistent id');
+		return null;
+	end if;
+
+	-- find underlying crime record
+	-- only do stuff if crime not already posted
+	if p_crime_persistent_id is not null and length(p_crime_persistent_id) > 0
+	then
+	 	select 	distinct
+			hex(id), date_format(date_event, date_resolution)
+	 	into 	l_crime_event_id, l_crime_month
+	 	from 	event
+	 	where	name = p_crime_persistent_id
+	 	and	type = 'police-crime'
+		order by timestamp_created desc
+	 	limit 1;
+	end if;
+
+	-- if there is no persistent_id, use crime_id instead
+	if l_crime_event_id is null and p_crime_id is not null and length(p_crime_id) > 0
+	then
+		select 	distinct 
+			hex(id), date_format(date_event, date_resolution)
+		into 	l_crime_event_id, l_crime_month
+		from 	event
+		where	identifier = p_crime_id
+		and	type = 'police-crime'
+		order by timestamp_created desc
+		limit 1;
+	end if;
+
+/*
+	if p_crime_id is not null
+	then
+		select 	distinct hex(id), date_format(date_event, date_resolution)
+		into 	l_crime_event_id, l_crime_month
+		from	event
+		where	identifier = p_crime_id
+		and	type = 'police-crime';
+	end if;
+
+	-- if you can't find crime_id, check persistent_id instead
+	if p_crime_id is null and p_crime_persistent_id is not null and length(p_crime_persistent_id) > 0
+	then
+		select 	distinct hex(id), date_format(date_event, date_resolution)
+		into 	l_crime_event_id, l_crime_month
+		from	event
+		where	name = p_crime_persistent_id
+		and	type = 'police-crime';
+	end if;
+*/
+
+	-- call log(concat('DEBUG : l_crime_event_id = ', ifnull(l_crime_event_id, 'NULL') ));
+
+	-- can only meaningfully add outcomes to existing crimes dated before the outcome
+	-- noticed that outcome data sometimes comes before crime data in police data stream. Not sure what that means.
+	if l_crime_event_id is null -- or convert_string_to_date(l_crime_month) > convert_string_to_date(p_month)
+	then
+		-- call log(concat('ERROR: function post_police_outcome can only add outcomes to pre-existing crimes. Crime (police) ID "', ifnull(p_crime_id,'NULL'), '" or crime identifier "',  ifnull(p_crime_persistent_id, 'NULL'), '" does not exist.'));
+		-- return null;
+/*
+		-- log category
+		select 	hex(id)
+		into 	l_crime_category_id
+		from 	category
+		where 	identifier = 'unknown'
+		and	type = 'police-crime'
+		limit 1;
+
+		if l_crime_category_id is null
+		then	
+			set l_crime_category_id = post_category(
+				'police-crime',
+				'unknown',
+				'unknown',
+				null
+				);
+		end if;
+*/
+		-- add skeletal dummy crime record (that will, with luck, be updated with the real crime later)
+/*		set l_crime_event_id = post_event(
+				'police-crime',
+				p_crime_id,
+				p_crime_persistent_id,
+				null,
+				p_month,
+				l_date_format
+				);
+
+		set l_relation = post_relation(null, l_crime_event_id, l_crime_category_id);
+*/
+
+		set l_crime_event_id = post_police_crime(
+						if( length( ifnull(p_crime_category_code, '')) = 0 , 'unknown', p_crime_category_code),
+						p_crime_id,		
+						p_crime_persistent_id,
+						p_context,
+						ifnull(p_crime_month,p_month), 	
+						p_location_type,
+						p_location_subtype,
+						p_location_id,
+						p_location_name,
+						p_location_latitude,
+						p_location_longitude,
+						null,
+						null);
+
+		call log(concat('WARNING: function post_police_outcome added new crime record crime_id:"', ifnull(p_crime_id, 'NULL'), '", persistent_id:"', ifnull(p_crime_persistent_id, 'NULL'), '".' ));
+
+	end if;
+	
+	-- set crime_id or persistent_id where one or the other was null
+	select 	identifier, name
+	into 	p_crime_id, p_crime_persistent_id
+	from	event
+	where 	id = unhex(l_crime_event_id);
+
+	-- post category if not already there
+	select 	hex(id)
+	into 	l_outcome_category_id
+	from 	police_outcome_category
+	where 	code = p_category_code or name = p_category_name
+	limit 1;
+
+	if l_outcome_category_id is null
+	then	
+		set l_outcome_category_id = post_category(
+			'police-crime-outcome',
+			p_category_code,
+			p_category_name,
+			null
+			);
+	end if;
+
+	-- artificial (event) identifier (a checksum intended to be unique for the given variables)
+	-- set l_identifier = md5(concat( ifnull(p_crime_id, 'NULL'), '-', ifnull(p_category_code, 'NULL'), '-', ifnull(p_month, 'NULL') ));
+	set l_identifier = concat( ifnull(p_crime_id, 'NULL'), '-', ifnull(p_crime_persistent_id, 'NULL'), '-', ifnull(p_category_code, 'NULL'), '-', ifnull(p_month, 'NULL') );
+
+	-- check if this outcome of this crime has already been logged for this month
+	select	distinct 
+		hex(id)
+	into	l_outcome_event_id
+	from	event
+	where	type = 'police-crime-outcome'
+		and identifier = md5(l_identifier)
+	limit 1;
+
+	-- call log(concat('DEBUG : [old] l_outcome_event_id = ', ifnull(l_outcome_event_id, 'NULL') ));
+
+	if l_outcome_event_id is null
+	then
+		-- post basic outcome record
+		set l_outcome_event_id = post_event(
+				'police-crime-outcome',
+				md5(l_identifier),
+				l_identifier,
+				null,
+				p_month,
+				l_date_format
+				);
+		-- call log(concat('DEBUG : [new] l_outcome_event_id = ', ifnull(l_outcome_event_id, 'NULL') ));
+
+	-- else
+		-- cater for later amendments
+		-- outcomes are identified by crime, category and date, and change in any one of these is actually a new outcome
+
+		-- if p_crime_persistent_id is not null and l_old_crime_persistent_id != p_crime_persistent_id
+		-- then
+		-- 	set l_exists = put_event(l_outcome_event_id, 'name', p_crime_persistent_id);
+		-- end if;
+
+	end if;
+
+	-- link to crime and category record
+	if l_outcome_event_id is not null
+	then
+		if not exists_relation(null, l_crime_event_id, l_outcome_event_id)
+		then
+			set l_relation = post_relation(null, l_crime_event_id, l_outcome_event_id);
+		end if;
+
+		-- post category if not already there
+		select 	hex(id)
+		into 	l_outcome_category_id
+		from 	police_outcome_category
+		where 	code = p_category_code or name = p_category_name
+		limit 1;
+
+		if l_outcome_category_id is null
+		then	
+			set l_outcome_category_id = post_category(
+				'police-crime-outcome',
+				p_category_code,
+				p_category_name,
+				null
+				);
+		end if;
+		-- call log(concat('DEBUG : l_outcome_category_id = ', ifnull(l_outcome_category_id, 'NULL') ));
+
+		-- link to outcome record
+		if not exists_relation (null, l_outcome_event_id, l_outcome_category_id)
+		then
+			set l_relation = post_relation(null, l_outcome_event_id, l_outcome_category_id);
+		end if;
+
+	end if;
+
+	-- outcome events come from police api crime records (without persons) or from outcome records (with persons)
+	-- call log(concat('DEBUG : p_person_identifier = ', ifnull(p_person_identifier, 'NULL') ));
+	-- call log(concat('DEBUG : l_person_identifier = ', ifnull(l_person_identifier, 'NULL') ));
+	if l_outcome_event_id is not null and p_person_identifier is not null
+	then
+
+		select 	hex(id)
+		into 	l_person_id
+		from 	person
+		where 	identifier = p_person_identifier
+		and 	type = 'police-criminal'
+		limit 1;
+
+		-- call log(concat('DEBUG : l_person_id = ', ifnull(l_person_id, 'NULL') ));
+		if l_person_id is null
+		then
+			set l_person_id = post_person(
+						'police-criminal',
+						p_person_identifier,
+						null,
+						null,
+						null,
+						null
+						);
+		end if;
+
+		-- link person to outcome
+		if not exists_relation(null, l_person_id, l_outcome_event_id)
+		then
+			set l_relation = post_relation(null, l_person_id, l_outcome_event_id);
+		end if;
+
+		-- link person to crime (possibly redundant)
+		if not exists_relation(null, l_person_id, l_crime_event_id)
+		then
+			set l_relation = post_relation(null, l_person_id, l_crime_event_id);
+		end if;
+	end if;
+
+	if l_outcome_event_id is null
+	then
+		call log(concat('ERROR: function post_police_outcome failed:',
+			' p_category_name="', 		ifnull(p_category_name, 'NULL'), 
+			'", p_month="', 		ifnull(p_month, 'NULL'), 
+			'", p_person_identifier="', 	ifnull(p_person_identifier, 'NULL'), 
+			'", p_crime_category_code="', 	ifnull(p_crime_category_code, 'NULL'), 
+			'", p_crime_id="', 		ifnull(p_crime_id, 'NULL'),
+			'", p_crime_persistent_id="', 	ifnull(p_crime_persistent_id, 'NULL'), 
+			'", p_context="', 		ifnull(p_context, 'NULL'), 
+			'", p_crime_month="', 		ifnull(p_crime_month, 'NULL'), 
+			'", p_location_type="', 	ifnull(p_location_type, 'NULL'),
+			'", p_location_subtype="', 	ifnull(p_location_subtype, 'NULL'),
+			'", p_location_id="', 		ifnull(p_location_id, 'NULL'), 
+			'", p_location_name="', 	ifnull(p_location_name, 'NULL'), 
+			'", p_location_latitude="', 	ifnull(p_location_latitude, 'NULL'), 
+			'", p_location_longitude="', 	ifnull(p_location_longitude, 'NULL'),
+			'".'));
+	end if;
+
+	-- call log('DEBUG : END post_police_outcome');
+	return l_outcome_event_id;
+end;
+//
+set @function_count = ifnull(@function_count,0) + 1;
+//
+
 
 -- POLICE STOP --
 /*
@@ -5754,7 +6352,7 @@ begin
 	declare l_extension		boolean;
 	declare l_latitude		float;
 	declare l_longitude		float;
-	declare l_identifier		varchar(100);
+	declare l_identifier		varchar(500);
 	declare l_person_id		char(32);
 	declare l_stop_category_id	char(32);
 	-- declare l_old_outcome_linked_to_object_of_search	varchar(10);
@@ -5782,9 +6380,9 @@ begin
 	set p_officer_defined_ethnicity	= lower(ifnull(trim(p_officer_defined_ethnicity), 'unknown'));
 	set p_age_range = lower(ifnull(trim(p_age_range), 'unknown'));
 
-	if	p_stop_type is null 
-		or p_datetime is null
-		or p_location_id is null
+	if	length(ifnull(p_stop_type, '')) = 0 
+		or length(ifnull(p_datetime, '')) = 0 
+		or length(ifnull(p_location_id, '')) = 0 
 		or str_to_date(p_datetime, l_date_format) > now() 
 	then
 		call log('ERROR: function post_police_stop requires non-null stop type datetime and location_id, and must be dated in the past.');
@@ -5854,16 +6452,16 @@ begin
 	if p_involved_person = 'true' or p_involved_person = '1'
 	then
 
-		-- artificial (person) identifier (a checksum intended to be unique for the given variables)
-		-- actually logs a 'classification' of person; each record may indicate 1+ persons. The same person may be counted in mutliple records (same person, many locations)
-		set l_identifier = md5(concat( ifnull(p_gender, 'NULL'), '-', ifnull(p_age_range, 'NULL'), '-', ifnull(p_officer_defined_ethnicity, 'NULL'), '-', ifnull(p_self_defined_ethnicity, 'NULL'), '-', ifnull(p_location_id, 'NULL') ));
+		-- artificial (person) identifier (a checksum intended to be unique for the given variables
+		-- actually logs a 'classification' of person; each record may indicate 1+ persons. The same person may be counted in multiple records (same person, many locations)
+		set l_identifier = concat( ifnull(p_gender, 'NULL'), '-', ifnull(p_age_range, 'NULL'), '-', ifnull(p_officer_defined_ethnicity, 'NULL'), '-', ifnull(p_self_defined_ethnicity, 'NULL'), '-', ifnull(p_location_id, 'NULL') );
 
 		-- call log(concat('DEBUG : l_identifier = ', ifnull(l_identifier, 'NULL') ));
 
 		select 	hex(id)
 		into 	l_person_id
 		from 	person
-		where 	identifier = l_identifier
+		where 	identifier = md5(l_identifier)
 		and 	type = 'police-stop'
 		order by ifnull(timestamp_updated, timestamp_created) desc
 		limit 1;
@@ -5874,9 +6472,9 @@ begin
 		then
 			set l_person_id = post_person(
 						'police-stop',
-						l_identifier,
+						md5(l_identifier),
 						null,
-						concat( ifnull(p_gender, 'NULL'), '-', ifnull(p_age_range, 'NULL'), '-', ifnull(p_officer_defined_ethnicity, 'NULL'), '-', ifnull(p_self_defined_ethnicity, 'NULL'), '-', ifnull(p_location_id, 'NULL') ),
+						l_identifier,
 						null,
 						p_gender
 						);
@@ -5904,43 +6502,36 @@ begin
 	end if;
 
 	-- artificial (event) identifier (a checksum intended to be unique for the given variables)
-	-- cant do this - can have 1+ stops at the same place, same time, same reason (ie 2 ppl stopped at once)
-	-- set l_identifier = md5(concat( ifnull(p_stop_type, 'NULL'), '-', ifnull(p_location_id, 'NULL'), '-', ifnull(p_datetime, 'NULL'), '-', ifnull(p_legislation, 'NULL'), '-', ifnull(p_object_of_search, 'NULL'), '-', ifnull(p_operation_name, 'NULL') ));
+	-- ?cant do this - can have 1+ stops at the same place, same time, same reason (ie 2 ppl stopped at once)
+	set l_identifier = concat( 	ifnull(p_stop_type, 'NULL'), '-', 
+					ifnull(p_location_id, 'NULL'), '-', 
+					ifnull(p_datetime, 'NULL'), '-', 
+					ifnull(p_operation_name, 'NULL') , '-', 
+					ifnull(p_legislation, 'NULL'), '-', 
+					ifnull(p_object_of_search, 'NULL'), '-', 
+					ifnull(p_outcome_linked_to_object_of_search, 'NULL'), '-', 
+					ifnull(p_involved_person, 'NULL'), '-', 
+					ifnull(p_removal_of_more_than_outer_clothing, 'NULL')
+				);
 
 	-- check if stop already logged
-/*
-	select distinct
-		stop.id 									,
-		column_get(stop.extension, 'outcome_linked_to_object_of_search' as char)	,
-		column_get(stop.extension, 'operation' as char)					,
-		column_get(stop.extension, 'removal_of_more_than_outer_clothing' as char)	,
-		column_get(stop.extension, 'outcome' as char)					,
-		column_get(stop.extension, 'involved_person' as char)				
-		-- police_stop_person.gender							,
-		-- police_stop_person.self_defined_ethnicity					,
-		-- police_stop_person.officer_defined_ethnicity					,
-		-- police_stop_person.age_range							
-	into	l_stop_event_id,
-		l_old_outcome_linked_to_object_of_search,
-		l_old_operation,
-		l_old_removal_of_more_than_outer_clothing,
-		l_old_outcome,
-		l_old_involved_person		
-	from	event stop
-		join relation category_relation			on stop.id = category_relation.major 
-		join police_stop_category			on category_relation.minor = police_stop_category.id
-	where 	identifier = l_identifier
-	and	stop.type = 'police-stop'
+	-- bit of a guess this; it's not easy to identify a unique stop, but we want to avoid adding duplicates!
+	select 	distinct 
+		hex(id)
+	into 	l_stop_event_id
+	from 	event
+	where	identifier = md5(l_identifier)
+	and	type = 'police-stop'
+	order by timestamp_created desc
 	limit 1;
 
 	if l_stop_event_id is null
 	then
-*/
 		-- post stop record
 		set l_stop_event_id = post_event(
 				'police-stop',
-				hex(ordered_uuid()), -- you have to assume each stop record is unique
-				null,
+				md5(l_identifier),
+				l_identifier,
 				p_legislation,
 				str_to_date(p_datetime, l_date_format),
 				l_date_format
@@ -5951,47 +6542,57 @@ begin
 		then
 			set l_extension = post_extension(l_stop_event_id, 'outcome_linked_to_object_of_search', p_outcome_linked_to_object_of_search);
 		end if;
+
 		if p_operation is not null and length(p_operation) > 0 
 		then
 			set l_extension = post_extension(l_stop_event_id, 'operation', p_operation);
 		end if;
+
 		if p_object_of_search is not null and length(p_object_of_search) > 0 
 		then
 			set l_extension = post_extension(l_stop_event_id, 'object_of_search', p_object_of_search);
 		end if;
+
 		if p_operation_name is not null and length(p_operation_name) > 0 
 		then	
 			set l_extension = post_extension(l_stop_event_id, 'operation_name', p_operation_name);
 		end if;
+
 		if p_removal_of_more_than_outer_clothing is not null and length(p_removal_of_more_than_outer_clothing) > 0 
 		then
 			set l_extension = post_extension(l_stop_event_id, 'removal_of_more_than_outer_clothing', p_removal_of_more_than_outer_clothing);
 		end if;
+
 		if p_outcome is not null and length(p_outcome) > 0 
 		then
 			set l_extension = post_extension(l_stop_event_id, 'outcome', p_outcome);
 		end if;
+
 		if p_involved_person is not null and length(p_involved_person) > 0 
 		then
 			set l_extension = post_extension(l_stop_event_id, 'involved_person', p_involved_person);
 		end if;
 
 		-- link to category
-		set l_relation = post_relation(null, l_stop_event_id, l_stop_category_id);
+		if not exists_relation (null, l_stop_event_id, l_stop_category_id)
+		then
+			set l_relation = post_relation(null, l_stop_event_id, l_stop_category_id);
+		end if;
 
 		-- link to location (if any)
-		if p_location_id is not null
+		if p_location_id is not null and not exists_relation (null, l_stop_event_id, l_place_id)
 		then
 			set l_relation = post_relation(null, l_stop_event_id, l_place_id);
 		end if;
 
 		-- link to person (if any)
-		if l_person_id is not null
+		if l_person_id is not null and not exists_relation (null, l_person_id, l_stop_event_id)
 		then
 			set l_relation = post_relation(null, l_person_id, l_stop_event_id);
 		end if;
+
 /*	else
-		-- cater for amendments
+		-- cater for amendments [not possible - no way to identify record]
 
 		if p_outcome_linked_to_object_of_search is not null and l_old_outcome_linked_to_object_of_search != p_outcome_linked_to_object_of_search
 		then
@@ -6017,9 +6618,10 @@ begin
 		then
 			set l_extension = post_extension(l_stop_event_id, 'location_type', p_involved_person);
 		end if;
+*/
 
 	end if;
-*/
+
 	-- call log('DEBUG : END post_police_stop');
 
 	return l_stop_event_id;
@@ -6031,6 +6633,8 @@ set @function_count = ifnull(@function_count,0) + 1;
 
 
 -- HUGINN CLASSIFICATION EXTENSIONS
+
+-- none of these routines do proper updates (ie, use 'put_extension' rather than 'post_extension' when record exists)
 
 -- local data loading routines
 drop function if exists post_local_politician;
@@ -6069,7 +6673,7 @@ begin
 	set p_facebook = trim(lower(p_facebook));
 	set p_twitter = trim(lower(p_twitter));
 
-	if	p_name is null
+	if	length(ifnull(p_name, '')) = 0
 	then
 		call log('ERROR: function post_local_politician requires non-null name.');
 		return null;
@@ -6206,6 +6810,7 @@ create function post_local_organisation
 (
 	p_type			varchar(50),
 	p_name			varchar(500),
+	p_abbreviation		varchar(10),
 	p_postal_address	varchar(500),
 	p_email_address		varchar(100),
 	p_website		varchar(100),
@@ -6219,13 +6824,14 @@ begin
 	declare l_relation_id 		char(32) default null;
 	declare l_extension_id 		char(32) default null;
 
-	if	p_name is null
+	if	length(ifnull(p_name, '')) = 0
 	then
 		call log('ERROR: function post_local_organisation requires non-null name.');
 		return null;
 	end if;
 
 	set p_name = propercase(p_name);
+	set p_abbreviation = trim(upper(p_abbreviation));
 	set p_type = regexp_replace(trim(lower(ifnull(p_type, 'unknown'))), ' +', '-');
 	set p_postal_address = propercase(p_postal_address);
 	set p_email_address = trim(lower(p_email_address));
@@ -6259,6 +6865,10 @@ begin
 	end if;
 
 	-- post extensions
+	if p_abbreviation is not null and length(p_abbreviation) > 0 
+	then
+		set l_extension_id = post_extension(l_organisation_id, 'abbreviation', p_abbreviation);
+	end if;
 	if p_email_address is not null and length(p_email_address) > 0 
 	then
 		set l_extension_id = post_extension(l_organisation_id, 'email_address', p_email_address);
@@ -6358,9 +6968,9 @@ begin
 	set p_postal_address = propercase(p_postal_address);
 	set p_organisation_name = propercase(p_organisation_name);
 
-	if	p_name is null
+	if	length(ifnull(p_name, '')) = 0
 	then
-		call log('ERROR: function post_local_politician requires non-null name.');
+		call log('ERROR: function post_local_person requires non-null name.');
 		return null;
 	end if;
 
@@ -6463,20 +7073,255 @@ end;
 set @function_count = ifnull(@function_count,0) + 1;
 //
 
-drop function if exists post_local_bus_route;
-//
-
 
 -- ONS extensions
 -- ward / borough demographic stats
+drop function if exists post_population;
+//
+create function post_population
+(
+	p_region_name		varchar(50), -- name of ward or constituency
+	p_region_type		varchar(50), -- 'ward' or 'constituency' etc
+	p_year			int,
+	p_gender		varchar(10),
+	p_age			int,
+	p_value			int
+)
+returns boolean
+begin
+	declare l_place_id		char(32) default null;
+	declare l_variable_name		varchar(64);
 
+	set p_region_name = trim(lower(p_region_name));
+	set p_region_type = regexp_replace(trim(lower(p_region_type)), ' +', '-');
+	set p_gender = trim(lower(ifnull(p_gender, '')));
 
+	-- sanity check input values
+	case p_gender
+		when 'm' 	then set p_gender = 'male';
+		when 'f' 	then set p_gender = 'female';
+		when 'tot' 	then set p_gender = 'total';
+		when 'a' 	then set p_gender = 'total';
+		when 'all' 	then set p_gender = 'total';
+		when '' 	then set p_gender = 'total';
+		else 		set p_gender = p_gender;
+	end case;
 
+	if p_gender not in ('male', 'female', 'trans', 'total')
+	then
+		call log(concat('ERROR: function post_population requires valid gender.' ));
+		return false;
+	end if;
+
+	if p_year is not null
+	then
+		if p_year < 1990 or p_year > 2100
+		then
+			call log(concat('ERROR: function post_population requires year later than 1990.' ));
+			return false;
+		end if;
+	end if;
+
+	if p_age is not null
+	then
+		if p_age < 0 or p_age > 100
+		then
+			call log(concat('ERROR: function post_population requires age between 0 and 100.' ));
+			return false;
+		end if;
+	end if;
+
+	if p_value is not null
+	then
+		if p_value < 0 or p_value > 70000000
+		then
+			call log(concat('ERROR: function post_population requires value between 0 and 70000000.' ));
+			return false;
+		end if;
+	end if;
+
+	-- 1 find ID of region
+	select 	hex(id)
+	into 	l_place_id
+	from 	place
+	where 	trim(lower(type)) = p_region_type
+	 and 	trim(lower(name)) = p_region_name
+	order by ifnull(timestamp_updated, timestamp_created) desc
+	limit 1;	
+
+	-- 2 create variable name
+	set l_variable_name = concat( ifnull(convert(p_year,char),'total'), '.', p_gender, '.', ifnull(convert(p_age,char), 'total'));
+
+	if l_place_id is not null and not exists_attribute(l_place_id, 'population', l_variable_name)
+	then
+		-- 3 post population value
+		-- call log(concat('DEBUG: l_place_id=', ifnull(l_place_id, 'null')));
+		-- call log(concat('DEBUG: l_variable_name=', ifnull(l_variable_name, 'null')));
+		return post_attribute(l_place_id, 'population', l_variable_name, convert(p_value,char));
+	end if;
+
+	call log(concat('ERROR: function post_population could not add attribute to ', p_region_type, ' "', p_region_name, '"' ));
+	return false;
+end;
+//
+set @function_count = ifnull(@function_count,0) + 1;
+//
+   
+-- an extended version of 'get_attribute' that gets nearest population value in time
+drop function if exists get_population;
+//
+create function get_population
+(
+	p_region_name		varchar(50), -- name of ward or constituency
+	p_region_type		varchar(50), -- 'ward' or 'constituency' etc
+	p_year			int,
+	p_gender		varchar(10),
+	p_age			int
+)
+returns int
+deterministic
+begin
+	declare l_place_id		char(32) default null;
+	declare l_variable_name		varchar(64);
+	declare l_orig_year		int;
+
+	set p_region_name = trim(lower(p_region_name));
+	set p_region_type = regexp_replace(trim(lower(p_region_type)), ' +', '-');
+	set p_gender = trim(lower(ifnull(p_gender, '')));
+	set l_orig_year = ifnull(p_year, 0);
+
+	-- sanity check input values
+	case p_gender
+		when 'm' 	then set p_gender = 'male';
+		when 'f' 	then set p_gender = 'female';
+		when 'tot' 	then set p_gender = 'total';
+		when 'a' 	then set p_gender = 'total';
+		when 'all' 	then set p_gender = 'total';
+		when '' 	then set p_gender = 'total';
+		else 		set p_gender = p_gender;
+	end case;
+
+	if p_gender not in ('male', 'female', 'trans', 'total')
+	then
+		call log(concat('ERROR: function get_population requires valid gender.' ));
+		return null;
+	end if;
+
+	if p_year is not null
+	then
+		if p_year < 1990 or p_year > 2100
+		then
+			call log(concat('ERROR: function get_population requires year later than 1990.' ));
+			return null;
+		end if;
+	end if;
+
+	if p_age is not null
+	then
+		if p_age < 0 or p_age > 100
+		then
+			call log(concat('ERROR: function get_population requires age between 0 and 100.' ));
+			return null;
+		end if;
+	end if;
+
+	-- 1 find ID of region
+	select 	hex(id)
+	into 	l_place_id
+	from 	place
+	where 	trim(lower(type)) = p_region_type
+	 and 	trim(lower(name)) = p_region_name
+	order by ifnull(timestamp_updated, timestamp_created) desc
+	limit 1;
+
+	if l_place_id is not null 
+	then
+		repeat
+			set l_variable_name = concat( ifnull(convert(p_year,char),'total'), '.', p_gender, '.', ifnull(convert(p_age,char), 'total'));
+			set p_year = ifnull(p_year, 0) - 1;
+		until (exists_attribute(l_place_id, 'population', l_variable_name) or p_year <= (l_orig_year - 5))
+		end repeat;
+
+		if exists_attribute(l_place_id, 'population', l_variable_name)
+		then
+			-- call log(concat('DEBUG: l_variable_name=', l_variable_name ));
+			return convert(get_attribute(l_place_id, 'population', l_variable_name), int);
+		end if;
+
+	end if;
+
+	call log(concat('ERROR: function get_population could not get attribute for ', p_region_type, ' "', p_region_name, '"' ));
+	return null;
+
+end;
+//
+set @function_count = ifnull(@function_count,0) + 1;
+//
+
+-- useful views
+
+create or replace view attribute_population
+as
+	select
+		place.name							as place_name,
+		place.type							as place_type,
+		substring_index(field_name, '.', 1) 				as year,
+		substring_index(substring_index(field_name, '.', 2), '.', -1) 	as gender,
+		substring_index(field_name, '.', -1) 				as age,
+		convert(field_value, int)					as population
+	from
+		attribute
+		join place on attribute.record_id = place.id
+	where
+		attribute.type = 'population';	
+
+//
+set @view_count = ifnull(@view_count,0) + 1;
+//
+
+-- create table to help hyperlinking of keywords
+create or replace view hyperlink
+as
+	select
+		name as keyword,
+		column_get(extension, 'website' as char(100)) as hyperlink
+	from
+		event
+	where	
+		column_get(extension, 'website' as char(100)) is not null
+	union
+	select
+		name as keyword,
+		column_get(extension, 'website' as char(100)) as hyperlink
+	from
+		organisation
+	where	
+		column_get(extension, 'website' as char(100)) is not null
+	union
+	select
+		name as keyword,
+		column_get(extension, 'website' as char(100)) as hyperlink
+	from
+		person
+	where	
+		column_get(extension, 'website' as char(100)) is not null
+	union
+	select
+		name as keyword,
+		column_get(extension, 'website' as char(100)) as hyperlink
+	from
+		place
+	where	
+		column_get(extension, 'website' as char(100)) is not null
+	;	
+//
+set @view_count = ifnull(@view_count,0) + 1;
+//
 -- JSNA extensions
 
 
-
 -- London Gazette extensions
+
 
 
 
@@ -6554,14 +7399,14 @@ procedure_block : begin
 		call log( concat('ERROR : Expected ', ifnull(get_variable('Expected # tables'),0), ' tables , found ', l_integer1));
 	end if;
 
-	select count( distinct table_name)
-	into 	l_integer1
-	from 	information_schema.views
-	where 	table_schema = schema();
+	-- select count( distinct table_name)
+	-- into 	l_integer1
+	-- from 	information_schema.views
+	-- where 	table_schema = schema();
 
-	if l_integer1 != ifnull(get_variable('Expected # views'),0) then
-		call log( concat('ERROR : Expected ', ifnull(get_variable('Expected # views'),0), ' views , found ', l_integer1));
-	end if;
+	-- if l_integer1 != ifnull(get_variable('Expected # views'),0) then
+	--	call log( concat('ERROR : Expected ', ifnull(get_variable('Expected # views'),0), ' views , found ', l_integer1));
+	-- end if;
 
 	select 	count( distinct specific_name)
 	into 	l_integer1
@@ -6750,12 +7595,14 @@ procedure_block : begin
 	if not	(
 		delete_place(l_place_id4)
 		and not exists_place('id', l_place_id4)
+		and exists_place('id', l_place_id1)
 		and exists_uuid(l_place_id4) is null
 		)
 	then
 		call log( 'ERROR : Failed to delete a created place.');
 	end if;
 
+	-- extensions
 	if not 	(   post_extension(l_place_id1, 'test_contact', '1-2-3')
 		and post_extension(l_place_id2, 'test_contact', '2-3-4')
 		and post_extension(l_place_id3, 'test_contact', '3-4-5')
@@ -6790,6 +7637,55 @@ procedure_block : begin
 		)
 	then
 		call log( 'ERROR : Failed to delete an extension to a place.');
+	end if;
+
+	-- attributes
+	if not (    post_attribute(l_place_id1, null, 'test1', 'test1')
+		and post_attribute(l_place_id2, null, 'test1', 'test1')
+		and post_attribute(l_place_id3, null, 'test1', 'test1')
+		and post_attribute(l_place_id1, 'test', 'test2', 'test2')
+		and post_attribute(l_place_id2, 'test', 'test2', 'test2')
+		and post_attribute(l_place_id3, 'test', 'test2', 'test2')
+	)
+	then
+		call log( 'ERROR : Failed to add an attribute to a place.');
+	end if;
+
+	if not (    exists_attribute(l_place_id1, null, 'test1')
+		and exists_attribute(l_place_id2, null, 'test1') 
+		and exists_attribute(l_place_id3, null, 'test1') 
+		and exists_attribute(l_place_id1, 'test', 'test2') 
+		and exists_attribute(l_place_id2, 'test', 'test2')
+		and exists_attribute(l_place_id3, 'test', 'test2') 
+		)
+	then
+		call log( 'ERROR : Failed to find an attribute of a place.');
+	end if;
+
+	if not (    get_attribute(l_place_id1, null, 'test1') = 'test1'
+		and get_attribute(l_place_id2, null, 'test1') = 'test1'
+		and get_attribute(l_place_id3, null, 'test1') = 'test1'
+		and get_attribute(l_place_id1, 'test', 'test2') = 'test2'
+		and get_attribute(l_place_id2, 'test', 'test2') = 'test2'
+		and get_attribute(l_place_id3, 'test', 'test2') = 'test2'
+		)
+	then
+		call log( 'ERROR : Failed to get an attribute from a place.');
+	end if;
+
+	if not	(put_attribute(l_place_id1, null, 'test1', 'test3')
+		and get_attribute(l_place_id1, null, 'test1') = 'test3'
+		)
+	then
+		call log( 'ERROR : Failed to amend an attribute to a place.');
+	end if;
+
+	if not	( delete_attribute(l_place_id2, null, 'test1')
+		and not exists_attribute(l_place_id2, null, 'test1')
+		and exists_attribute(l_place_id1, null, 'test1')
+		)
+	then
+		call log( 'ERROR : Failed to delete an attribute to a place.');
 	end if;
 
 	-- people
@@ -6850,12 +7746,14 @@ procedure_block : begin
 	if not	(
 		delete_person(l_person_id3)
 		and not exists_person('id', l_person_id3)
+		and exists_person('id', l_person_id1)
 		and exists_uuid(l_person_id3) is null
 		)
 	then
 		call log( 'ERROR : Failed to delete a created person.');
 	end if;
 
+	-- extensions
 	if not 	(   post_extension(l_person_id1, 'test_contact', '1-2-3')
 		and post_extension(l_person_id2, 'test_contact', '2-3-4')
 		and post_extension(l_person_id1, 'test_contact2', '1-2-3-2')
@@ -6886,6 +7784,49 @@ procedure_block : begin
 		)
 	then
 		call log( 'ERROR : Failed to delete an extension to a person.');
+	end if;
+
+	-- attributes
+	if not (    post_attribute(l_person_id1, null, 'test1', 'test1')
+		and post_attribute(l_person_id2, null, 'test1', 'test1')
+		and post_attribute(l_person_id1, 'test', 'test2', 'test2')
+		and post_attribute(l_person_id2, 'test', 'test2', 'test2')
+	)
+	then
+		call log( 'ERROR : Failed to add an attribute to a person.');
+	end if;
+
+	if not (    exists_attribute(l_person_id1, null, 'test1')
+		and exists_attribute(l_person_id2, null, 'test1') 
+		and exists_attribute(l_person_id1, 'test', 'test2') 
+		and exists_attribute(l_person_id2, 'test', 'test2')
+		)
+	then
+		call log( 'ERROR : Failed to find an attribute of a person.');
+	end if;
+
+	if not (    get_attribute(l_person_id1, null, 'test1') = 'test1'
+		and get_attribute(l_person_id2, null, 'test1') = 'test1'
+		and get_attribute(l_person_id2, 'test', 'test2') = 'test2'
+		and get_attribute(l_person_id2, 'test', 'test2') = 'test2'
+		)
+	then
+		call log( 'ERROR : Failed to get an attribute from a person.');
+	end if;
+
+	if not	(put_attribute(l_person_id1, null, 'test1', 'test3')
+		and get_attribute(l_person_id1, null, 'test1') = 'test3'
+		)
+	then
+		call log( 'ERROR : Failed to amend an attribute to a person.');
+	end if;
+
+	if not	( delete_attribute(l_person_id2, null, 'test1')
+		and not exists_attribute(l_person_id2, null, 'test1')
+		and exists_attribute(l_person_id1, null, 'test1')
+		)
+	then
+		call log( 'ERROR : Failed to delete an attribute to a person.');
 	end if;
 
 	-- events
@@ -6947,19 +7888,21 @@ procedure_block : begin
 	if not	(
 		delete_event(l_event_id3)
 		and not exists_event('id', l_event_id3)
+		and exists_event('id', l_event_id1)
 		and exists_uuid(l_event_id3) is null
 		)
 	then
 		call log( 'ERROR : Failed to delete a created event.');
 	end if;
 
+	-- extensions
 	if not 	(   post_extension(l_event_id1, 'test_contact', '1-2-3')
 		and post_extension(l_event_id2, 'test_contact', '2-3-4')
 		and post_extension(l_event_id1, 'test_contact2', '1-2-3-2')
 		and post_extension(l_event_id2, 'test_contact2', '2-3-4-2')
 		)
 	then
-		call log( 'ERROR : Failed to add an extension to a person.');
+		call log( 'ERROR : Failed to add an extension to an event.');
 	end if;
 
 	if not (    get_extension(l_event_id1, 'test_contact') = '1-2-3'
@@ -6968,21 +7911,64 @@ procedure_block : begin
 		and get_extension(l_event_id2, 'test_contact2') = '2-3-4-2'
 		)
 	then
-		call log( 'ERROR : Failed to get an extension from a event.');
+		call log( 'ERROR : Failed to get an extension from an event.');
 	end if;
 
 	if not	(put_extension(l_event_id1, 'test_contact', 'ABC')
 		and get_extension(l_event_id1, 'test_contact') = 'ABC'
 		)
 	then
-		call log( 'ERROR : Failed to amend an extension to a event.');
+		call log( 'ERROR : Failed to amend an extension to an event.');
 	end if;
 
 	if not	(delete_extension(l_event_id2, 'test_contact2')
 		and not exists_extension(l_event_id2, 'test_contact2')
 		)
 	then
-		call log( 'ERROR : Failed to delete an extension to a event.');
+		call log( 'ERROR : Failed to delete an extension to an event.');
+	end if;
+
+	-- attributes
+	if not (    post_attribute(l_event_id1, null, 'test1', 'test1')
+		and post_attribute(l_event_id2, null, 'test1', 'test1')
+		and post_attribute(l_event_id1, 'test', 'test2', 'test2')
+		and post_attribute(l_event_id2, 'test', 'test2', 'test2')
+	)
+	then
+		call log( 'ERROR : Failed to add an attribute to an event.');
+	end if;
+
+	if not (    exists_attribute(l_event_id1, null, 'test1')
+		and exists_attribute(l_event_id2, null, 'test1') 
+		and exists_attribute(l_event_id1, 'test', 'test2') 
+		and exists_attribute(l_event_id2, 'test', 'test2')
+		)
+	then
+		call log( 'ERROR : Failed to find an attribute of an event.');
+	end if;
+
+	if not (    get_attribute(l_event_id1, null, 'test1') = 'test1'
+		and get_attribute(l_event_id2, null, 'test1') = 'test1'
+		and get_attribute(l_event_id1, 'test', 'test2') = 'test2'
+		and get_attribute(l_event_id2, 'test', 'test2') = 'test2'
+		)
+	then
+		call log( 'ERROR : Failed to get an attribute from an event.');
+	end if;
+
+	if not	(put_attribute(l_event_id1, null, 'test1', 'test3')
+		and get_attribute(l_event_id1, null, 'test1') = 'test3'
+		)
+	then
+		call log( 'ERROR : Failed to amend an attribute to an event.');
+	end if;
+
+	if not	( delete_attribute(l_event_id2, null, 'test1')
+		and not exists_attribute(l_event_id2, null, 'test1')
+		and exists_attribute(l_event_id1, null, 'test1')
+		)
+	then
+		call log( 'ERROR : Failed to delete an attribute to an event.');
 	end if;
 
 	-- organisations
@@ -7033,19 +8019,21 @@ procedure_block : begin
 	if not	(
 		delete_organisation(l_organisation_id3)
 		and not exists_organisation('id', l_organisation_id3)
+		and exists_organisation('id', l_organisation_id1)
 		and exists_uuid(l_organisation_id3) is null
 		)
 	then
 		call log( 'ERROR : Failed to delete a created organisation.');
 	end if;
 
+	-- extensions
 	if not 	(   post_extension(l_organisation_id1, 'test_contact', '1-2-3')
 		and post_extension(l_organisation_id2, 'test_contact', '2-3-4')
 		and post_extension(l_organisation_id1, 'test_contact2', '1-2-3-2')
 		and post_extension(l_organisation_id2, 'test_contact2', '2-3-4-2')
 		)
 	then
-		call log( 'ERROR : Failed to add an extension to a person.');
+		call log( 'ERROR : Failed to add an extension to an organisation.');
 	end if;
 
 	if not (    get_extension(l_organisation_id1, 'test_contact') = '1-2-3'
@@ -7054,21 +8042,64 @@ procedure_block : begin
 		and get_extension(l_organisation_id2, 'test_contact2') = '2-3-4-2'
 		)
 	then
-		call log( 'ERROR : Failed to get an extension from a organisation.');
+		call log( 'ERROR : Failed to get an extension from an organisation.');
 	end if;
 
 	if not	(put_extension(l_organisation_id1, 'test_contact', 'ABC')
 		and get_extension(l_organisation_id1, 'test_contact') = 'ABC'
 		)
 	then
-		call log( 'ERROR : Failed to amend an extension to a organisation.');
+		call log( 'ERROR : Failed to amend an extension to an organisation.');
 	end if;
 
 	if not	(delete_extension(l_organisation_id2, 'test_contact2')
 		and not exists_extension(l_organisation_id2, 'test_contact2')
 		)
 	then
-		call log( 'ERROR : Failed to delete an extension to a organisation.');
+		call log( 'ERROR : Failed to delete an extension to an organisation.');
+	end if;
+
+	-- attributes
+	if not (    post_attribute(l_organisation_id1, null, 'test1', 'test1')
+		and post_attribute(l_organisation_id2, null, 'test1', 'test1')
+		and post_attribute(l_organisation_id1, 'test', 'test2', 'test2')
+		and post_attribute(l_organisation_id2, 'test', 'test2', 'test2')
+	)
+	then
+		call log( 'ERROR : Failed to add an attribute to an organisation.');
+	end if;
+
+	if not (    exists_attribute(l_organisation_id1, null, 'test1')
+		and exists_attribute(l_organisation_id2, null, 'test1') 
+		and exists_attribute(l_organisation_id1, 'test', 'test2') 
+		and exists_attribute(l_organisation_id2, 'test', 'test2')
+		)
+	then
+		call log( 'ERROR : Failed to find an attribute of an organisation.');
+	end if;
+
+	if not (    get_attribute(l_organisation_id1, null, 'test1') = 'test1'
+		and get_attribute(l_organisation_id2, null, 'test1') = 'test1'
+		and get_attribute(l_organisation_id1, 'test', 'test2') = 'test2'
+		and get_attribute(l_organisation_id2, 'test', 'test2') = 'test2'
+		)
+	then
+		call log( 'ERROR : Failed to get an attribute from an organisation.');
+	end if;
+
+	if not	(put_attribute(l_organisation_id1, null, 'test1', 'test3')
+		and get_attribute(l_organisation_id1, null, 'test1') = 'test3'
+		)
+	then
+		call log( 'ERROR : Failed to amend an attribute to an organisation.');
+	end if;
+
+	if not	( delete_attribute(l_organisation_id2, null, 'test1')
+		and not exists_attribute(l_organisation_id2, null, 'test1')
+		and exists_attribute(l_organisation_id1, null, 'test1')
+		)
+	then
+		call log( 'ERROR : Failed to delete an attribute to an organisation.');
 	end if;
 
 	-- categories
@@ -7118,6 +8149,7 @@ procedure_block : begin
 
 	if not	(delete_category(l_category_id3)
 		and not exists_category('id', l_category_id3)
+		and exists_category('id', l_category_id1)
 		and exists_uuid(l_category_id3) is null
 		)
 	then
@@ -7159,6 +8191,7 @@ procedure_block : begin
 
 	if not (delete_relation(null, l_person_id2, l_organisation_id1)
 		and not exists_relation(null, l_person_id2, l_organisation_id1)
+		and exists_relation(null, l_person_id1, l_organisation_id1)
 		)
 	then
 		call log( 'ERROR : Failed to delete a person at an organisation.');
@@ -7176,6 +8209,7 @@ procedure_block : begin
 
 	if not (delete_relation(null, l_person_id2, l_event_id1)
 		and not exists_relation(null, l_person_id2, l_event_id1)
+		and exists_relation(null, l_person_id1, l_event_id1)
 		)
 	then
 		call log( 'ERROR : Failed to delete a person at an event.');
@@ -7193,6 +8227,7 @@ procedure_block : begin
 
 	if not (delete_relation(null, l_person_id2, l_place_id1)
 		and not exists_relation(null, l_person_id2, l_place_id1)
+		and exists_relation(null, l_person_id1, l_place_id1)
 		)
 	then
 		call log( 'ERROR : Failed to delete a person at a place.');
@@ -7210,6 +8245,7 @@ procedure_block : begin
 
 	if not (delete_relation(null, l_event_id2, l_place_id1)
 		and not exists_relation(null, l_event_id2, l_place_id1)
+		and exists_relation(null, l_event_id1, l_place_id1)
 		)
 	then
 		call log( 'ERROR : Failed to delete a event at a place.');
@@ -7227,6 +8263,7 @@ procedure_block : begin
 
 	if not (delete_relation(null, l_organisation_id2, l_place_id1)
 		and not exists_relation(null, l_organisation_id2, l_place_id1)
+		and exists_relation(null, l_organisation_id1, l_place_id1)
 		)
 	then
 		call log( 'ERROR : Failed to delete an organisation at a place.');
@@ -7244,6 +8281,7 @@ procedure_block : begin
 
 	if not (delete_relation(null, l_organisation_id2, l_event_id1)
 		and not exists_relation(null, l_organisation_id2, l_event_id1)
+		and exists_relation(null, l_organisation_id1, l_event_id1)
 		)
 	then
 		call log( 'ERROR : Failed to delete an organisation at an event.');
@@ -7486,8 +8524,17 @@ procedure_block : begin
 					l_outcome_category_name,
 					l_outcome_date,
 					l_person_identifier,
+					null,
 					l_crime_identifier,
-					l_crime_persistent_id
+					l_crime_persistent_id,
+					null,
+					null,
+					null,
+					null,
+					null,
+					null,
+					null,
+					null
 					);
 
 		set l_count = l_count + 1;
@@ -7717,7 +8764,6 @@ end;
 set @procedure_count = ifnull(@procedure_count,0) + 1;
 //
 
-
 drop event if exists daily_housekeeping;
 //
 create event daily_housekeeping
@@ -7725,7 +8771,7 @@ on schedule
 	every 1 day 
 	starts date_add( from_days(to_days( current_timestamp )),  interval (24 + 2) hour )
 on completion preserve
-comment 'Sets standard views.'
+comment 'Sets standard views and deletes old logs.'
 do
 begin	
 	declare	l_err_code	char(5) default '00000';
@@ -7773,7 +8819,7 @@ call post_variable ('crime-last-updated', '2010-11-30');
 -- call post_variable ('crime-last-updated', '2016-01-30');
 //
 -- region interested in
-call post_variable ('region', 'Reading Borough Council');
+call post_variable ('region', 'Reading Borough');
 //
 
 
